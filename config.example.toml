@@ -1,0 +1,53 @@
+# llmcmd configuration file
+# Copy to ~/.config/llmcmd/config.toml
+
+# Backend configuration
+# Supported types: ollama, anthropic, openai
+[backend]
+type = "ollama"
+host = "http://localhost:11434"
+# default_profile selects which profile to use by default
+default_profile = "default"
+
+# For Anthropic Claude API:
+# [backend]
+# type = "anthropic"
+# default_profile = "default"
+# api_key = "sk-ant-..." # Or set ANTHROPIC_API_KEY env var
+
+# For OpenAI API:
+# [backend]
+# type = "openai"
+# default_profile = "default"
+# api_key = "sk-..." # Or set OPENAI_API_KEY env var
+
+# Model profiles
+# Define different model configurations for different use cases
+# Use with: llmcmd --profile <name> or llmcmd --fast (alias for "fast" profile)
+[profiles.default]
+model = "qwen2.5-coder:7b"
+temperature = 0.1
+
+[profiles.fast]
+model = "qwen2.5-coder:1.5b"
+temperature = 0.1
+
+[profiles.precise]
+model = "qwen2.5-coder:32b"
+temperature = 0.0
+
+# Cloud provider profile examples:
+# [profiles.claude]
+# model = "claude-3-5-haiku-latest"
+# temperature = 0.1
+
+# [profiles.gpt]
+# model = "gpt-4o-mini"
+# temperature = 0.1
+
+# User preferences for command generation
+[preferences]
+# Prefer modern tools (rg/fd/bat over grep/find/cat)
+modern_tools = true
+# Prefer verbose flags (--recursive over -r)
+verbose_flags = true
