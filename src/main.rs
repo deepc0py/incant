@@ -52,12 +52,33 @@ enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Manage Ollama models (pull, list, remove)
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
     /// Open configuration file in $EDITOR
     Config,
     /// Install shell integration
     Install,
     /// List available profiles
     Profiles,
+}
+
+#[derive(Subcommand)]
+enum ModelsAction {
+    /// List locally available models
+    List,
+    /// Pull/download a model from Ollama registry
+    Pull {
+        /// Model name (e.g., qwen2.5-coder:7b, llama3.2:3b)
+        model: String,
+    },
+    /// Remove a model from local storage
+    Remove {
+        /// Model name to remove
+        model: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -78,6 +99,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Daemon { action }) => handle_daemon(action).await,
+        Some(Commands::Models { action }) => handle_models(action).await,
         Some(Commands::Config) => handle_config(),
         Some(Commands::Install) => handle_install(),
         Some(Commands::Profiles) => handle_profiles(),
@@ -197,6 +219,187 @@ async fn run_daemon_foreground() -> Result<()> {
 
     let server = daemon::DaemonServer::new(config)?;
     server.run().await
+}
+
+/// Handle models subcommand (for Ollama).
+async fn handle_models(action: ModelsAction) -> Result<()> {
+    let config = config::Config::load()?;
+
+    // Get Ollama host from config
+    let host = match &config.backend {
+        config::BackendConfig::Ollama { host, .. } => host.clone(),
+        _ => {
+            // Use default Ollama host even if not the active backend
+            "http://localhost:11434".to_string()
+        }
+    };
+
+    match action {
+        ModelsAction::List => list_models(&host).await,
+        ModelsAction::Pull { model } => pull_model(&host, &model).await,
+        ModelsAction::Remove { model } => remove_model(&host, &model).await,
+    }
+}
+
+/// List available Ollama models.
+async fn list_models(host: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/tags", host);
+
+    let response = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .context("Failed to connect to Ollama. Is it running?")?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to list models: {}",
+            response.status()
+        ));
+    }
+
+    let data: serde_json::Value = response.json().await?;
+
+    println!("Available Models");
+    println!("================\n");
+
+    if let Some(models) = data.get("models").and_then(|m| m.as_array()) {
+        if models.is_empty() {
+            println!("No models installed.");
+            println!("\nPull a model with: llmcmd models pull <model>");
+            println!("Example: llmcmd models pull qwen2.5-coder:7b");
+        } else {
+            for model in models {
+                let name = model.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                let size = model
+                    .get("size")
+                    .and_then(|s| s.as_u64())
+                    .map(|s| format_size(s))
+                    .unwrap_or_else(|| "?".to_string());
+                let modified = model
+                    .get("modified_at")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.split('T').next().unwrap_or(s))
+                    .unwrap_or("?");
+
+                println!("  {} ({}) - {}", name, size, modified);
+            }
+        }
+    } else {
+        println!("No models found.");
+    }
+
+    Ok(())
+}
+
+/// Format bytes to human-readable size.
+fn format_size(bytes: u64) -> String {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+
+    if bytes >= GB {
+        format!("{:.1}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.0}MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+/// Pull/download a model from Ollama.
+async fn pull_model(host: &str, model: &str) -> Result<()> {
+    println!("Pulling model: {}", model);
+    println!("This may take a while depending on model size...\n");
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/pull", host);
+
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({ "name": model, "stream": true }))
+        .timeout(std::time::Duration::from_secs(3600)) // 1 hour timeout for large models
+        .send()
+        .await
+        .context("Failed to connect to Ollama. Is it running?")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("Failed to pull model: {} - {}", status, body));
+    }
+
+    // Stream the response to show progress
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut last_status = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        // Each line is a JSON object
+        for line in String::from_utf8_lossy(&chunk).lines() {
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(status) = json.get("status").and_then(|s| s.as_str()) {
+                    // Only print if status changed
+                    if status != last_status {
+                        if let Some(completed) = json.get("completed").and_then(|c| c.as_u64()) {
+                            if let Some(total) = json.get("total").and_then(|t| t.as_u64()) {
+                                let pct = (completed as f64 / total as f64 * 100.0) as u32;
+                                print!("\r{}: {}% ({}/{})", status, pct, format_size(completed), format_size(total));
+                                std::io::Write::flush(&mut std::io::stdout())?;
+                            }
+                        } else {
+                            println!("{}", status);
+                        }
+                        last_status = status.to_string();
+                    } else if json.get("completed").is_some() {
+                        // Update progress on same line
+                        if let Some(completed) = json.get("completed").and_then(|c| c.as_u64()) {
+                            if let Some(total) = json.get("total").and_then(|t| t.as_u64()) {
+                                let pct = (completed as f64 / total as f64 * 100.0) as u32;
+                                print!("\r{}: {}% ({}/{})", status, pct, format_size(completed), format_size(total));
+                                std::io::Write::flush(&mut std::io::stdout())?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("\n\nModel '{}' pulled successfully!", model);
+    Ok(())
+}
+
+/// Remove a model from Ollama.
+async fn remove_model(host: &str, model: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/delete", host);
+
+    let response = client
+        .delete(&url)
+        .json(&serde_json::json!({ "name": model }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .context("Failed to connect to Ollama. Is it running?")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Failed to remove model: {} - {}",
+            status,
+            body
+        ));
+    }
+
+    println!("Model '{}' removed successfully.", model);
+    Ok(())
 }
 
 /// Handle the config command.
