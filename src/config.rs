@@ -247,6 +247,17 @@ impl Config {
         }
     }
 
+    /// Get the startup status file path for daemon startup reporting.
+    pub fn startup_status_path() -> Result<PathBuf> {
+        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            Ok(PathBuf::from(runtime_dir).join("llmcmd.startup"))
+        } else {
+            dirs::home_dir()
+                .map(|p| p.join(".local/run/llmcmd.startup"))
+                .context("Could not determine home directory")
+        }
+    }
+
     /// Load configuration from file, using defaults if not found.
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;

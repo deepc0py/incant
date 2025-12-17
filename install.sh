@@ -78,7 +78,10 @@ setup_shell_integration() {
             integration='
 # llmcmd shell integration
 function _llmcmd_widget() {
-    local cmd=$(llmcmd)
+    local cmd
+    # Connect stdin to /dev/tty so TUI can read input
+    # stdout is captured, stderr and TUI go to terminal
+    cmd=$(llmcmd </dev/tty)
     if [[ -n "$cmd" ]]; then
         LBUFFER+="$cmd"
     fi
@@ -92,7 +95,9 @@ bindkey '"'"'^k'"'"' _llmcmd_widget'
             integration='
 # llmcmd shell integration
 _llmcmd_readline() {
-    local cmd=$(llmcmd)
+    local cmd
+    # Connect stdin to /dev/tty so TUI can read input
+    cmd=$(llmcmd </dev/tty)
     READLINE_LINE="${READLINE_LINE}${cmd}"
     READLINE_POINT=${#READLINE_LINE}
 }
@@ -103,7 +108,8 @@ bind -x '"'"'"\C-k": _llmcmd_readline'"'"''
             integration='
 # llmcmd shell integration
 function _llmcmd_fish
-    set -l cmd (llmcmd)
+    # Connect stdin to /dev/tty so TUI can read input
+    set -l cmd (llmcmd </dev/tty)
     commandline -i $cmd
 end
 bind \ck _llmcmd_fish'
@@ -140,20 +146,158 @@ bind \ck _llmcmd_fish'
     fi
 }
 
-# Check Ollama (default backend)
-check_ollama() {
+# Detect OS
+detect_os() {
+    case "$(uname -s)" in
+        Darwin)
+            OS="macos"
+            ;;
+        Linux)
+            OS="linux"
+            ;;
+        *)
+            OS="unknown"
+            ;;
+    esac
+}
+
+# Install Ollama
+install_ollama() {
+    info "Installing Ollama..."
+
+    if [ "$OS" = "macos" ]; then
+        # Check if Homebrew is available
+        if command -v brew &> /dev/null; then
+            info "Installing via Homebrew..."
+            brew install ollama
+        else
+            info "Installing via official installer..."
+            curl -fsSL https://ollama.ai/install.sh | sh
+        fi
+    elif [ "$OS" = "linux" ]; then
+        info "Installing via official installer..."
+        curl -fsSL https://ollama.ai/install.sh | sh
+    else
+        error "Unsupported OS for automatic Ollama installation"
+    fi
+
+    if command -v ollama &> /dev/null; then
+        info "Ollama installed successfully"
+        return 0
+    else
+        error "Failed to install Ollama"
+    fi
+}
+
+# Start Ollama service
+start_ollama() {
+    info "Starting Ollama..."
+
+    if [ "$OS" = "macos" ]; then
+        # On macOS, check if installed via brew (has service) or standalone
+        if brew services list 2>/dev/null | grep -q ollama; then
+            brew services start ollama
+        else
+            # Start in background
+            nohup ollama serve > /dev/null 2>&1 &
+            sleep 2
+        fi
+    elif [ "$OS" = "linux" ]; then
+        # Try systemd first, fall back to manual
+        if systemctl is-enabled ollama &> /dev/null 2>&1; then
+            sudo systemctl start ollama
+        else
+            nohup ollama serve > /dev/null 2>&1 &
+            sleep 2
+        fi
+    fi
+
+    # Verify it started
+    sleep 2
+    if curl -s http://localhost:11434/api/tags &> /dev/null; then
+        info "Ollama is now running"
+        return 0
+    else
+        warn "Ollama may not have started. Try running 'ollama serve' manually."
+        return 1
+    fi
+}
+
+# Pull default model
+pull_default_model() {
+    local model="qwen2.5-coder:7b"
+
+    # Check if model already exists
+    if ollama list 2>/dev/null | grep -q "$model"; then
+        info "Model $model already available"
+        return 0
+    fi
+
+    echo ""
+    info "Pulling default model: $model"
+    info "This may take a few minutes depending on your connection..."
+    echo ""
+
+    if ollama pull "$model"; then
+        info "Model $model pulled successfully"
+        return 0
+    else
+        warn "Failed to pull model. You can try later with: ollama pull $model"
+        return 1
+    fi
+}
+
+# Check and setup Ollama (default backend)
+setup_ollama() {
+    detect_os
+
     if command -v ollama &> /dev/null; then
         info "Ollama found"
-        if curl -s http://localhost:11434/api/tags &> /dev/null; then
-            info "Ollama is running"
-        else
-            warn "Ollama is installed but not running"
-            warn "Start with: ollama serve"
-        fi
     else
-        warn "Ollama not found"
-        warn "Install from https://ollama.ai/ for local LLM support"
-        warn "Or configure an API backend in $CONFIG_DIR/config.toml"
+        echo ""
+        info "Ollama is not installed (required for local LLM support)"
+        echo ""
+        read -p "Install Ollama now? [Y/n] " -n 1 -r
+        echo ""
+
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            install_ollama
+        else
+            warn "Skipping Ollama installation"
+            warn "Configure an API backend (Anthropic/OpenAI) in $CONFIG_DIR/config.toml"
+            warn "Or install Ollama later from https://ollama.ai/"
+            return 0
+        fi
+    fi
+
+    # Check if running
+    if curl -s http://localhost:11434/api/tags &> /dev/null; then
+        info "Ollama is running"
+    else
+        echo ""
+        read -p "Start Ollama now? [Y/n] " -n 1 -r
+        echo ""
+
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            start_ollama
+        else
+            warn "Ollama is not running. Start with: ollama serve"
+            return 0
+        fi
+    fi
+
+    # Check if Ollama is running before trying to pull
+    if curl -s http://localhost:11434/api/tags &> /dev/null; then
+        # Offer to pull default model
+        echo ""
+        read -p "Pull the default model (qwen2.5-coder:7b, ~4.7GB)? [Y/n] " -n 1 -r
+        echo ""
+
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            pull_default_model
+        else
+            info "Skipping model download. Pull later with: ollama pull qwen2.5-coder:7b"
+        fi
     fi
 }
 
@@ -168,7 +312,7 @@ main() {
     build_project
     install_binary
     create_config
-    check_ollama
+    setup_ollama
     setup_shell_integration
 
     echo ""

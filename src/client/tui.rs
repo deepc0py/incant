@@ -4,7 +4,6 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,9 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
-use std::io::{self, Stdout};
-use tui_input::backend::crossterm::EventHandler;
-use tui_input::Input;
+use std::io::{self, Read, Write};
 
 /// Result of the TUI interaction.
 pub enum TuiResult {
@@ -30,71 +27,116 @@ pub enum TuiResult {
 
 /// Run the TUI and return the user's query.
 pub fn run_tui(initial_query: Option<String>) -> Result<TuiResult> {
-    // Setup terminal
+    // Like fzf, we use:
+    // - stderr for TUI output (goes to terminal even in command substitution)
+    // - stdin for keyboard input (redirected from /dev/tty by shell widget)
+    // - stdout only for final command (captured by shell)
+
+    // Setup terminal - write TUI to stderr (like fzf does)
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    let mut stderr = io::stderr();
+    if let Err(e) = execute!(stderr, EnterAlternateScreen) {
+        disable_raw_mode()?;
+        return Err(anyhow::anyhow!("Failed to enter alternate screen: {}", e));
+    }
+
+    let backend = CrosstermBackend::new(io::stderr());
     let mut terminal = Terminal::new(backend)?;
 
     // Run the input loop
     let result = run_input_loop(&mut terminal, initial_query);
 
-    // Restore terminal
+    // Restore terminal state
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    let _ = execute!(io::stderr(), LeaveAlternateScreen);
 
     result
 }
 
-/// The main input loop.
-fn run_input_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+/// The main input loop using direct stdin reading (avoids crossterm event system issues on macOS).
+fn run_input_loop<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
     initial_query: Option<String>,
 ) -> Result<TuiResult> {
-    let mut input = Input::default();
-
-    // Set initial value if provided
-    if let Some(query) = initial_query {
-        input = input.with_value(query);
-    }
+    let mut input_text = initial_query.unwrap_or_default();
+    let mut stdin = io::stdin();
+    let mut buf = [0u8; 1];
 
     loop {
         // Draw the UI
-        terminal.draw(|frame| draw_ui(frame, &input))?;
+        terminal.draw(|frame| draw_ui(frame, &input_text))?;
 
-        // Handle events
-        if let Event::Key(key) = event::read()? {
-            // Only handle key press events (not release)
-            if key.kind != KeyEventKind::Press {
-                continue;
+        // Read single byte from stdin (in raw mode, we get one byte at a time)
+        if stdin.read(&mut buf)? == 0 {
+            return Ok(TuiResult::Cancelled);
+        }
+
+        match buf[0] {
+            // Enter
+            b'\r' | b'\n' => {
+                if input_text.is_empty() {
+                    return Ok(TuiResult::Cancelled);
+                }
+                return Ok(TuiResult::Query(input_text));
             }
+            // Escape
+            0x1b => {
+                // Check if it's just Escape or an escape sequence
+                // For simplicity, treat any escape as cancel
+                return Ok(TuiResult::Cancelled);
+            }
+            // Ctrl+C
+            0x03 => {
+                return Ok(TuiResult::Cancelled);
+            }
+            // Backspace (ASCII DEL or BS)
+            0x7f | 0x08 => {
+                input_text.pop();
+            }
+            // Ctrl+U (clear line)
+            0x15 => {
+                input_text.clear();
+            }
+            // Ctrl+W (delete word)
+            0x17 => {
+                // Delete last word
+                let trimmed = input_text.trim_end();
+                if let Some(pos) = trimmed.rfind(' ') {
+                    input_text.truncate(pos + 1);
+                } else {
+                    input_text.clear();
+                }
+            }
+            // Regular printable ASCII
+            c if c >= 0x20 && c < 0x7f => {
+                input_text.push(c as char);
+            }
+            // UTF-8 multi-byte sequences
+            c if c >= 0x80 => {
+                // Determine how many bytes in this UTF-8 character
+                let width = if c & 0xE0 == 0xC0 { 2 }
+                    else if c & 0xF0 == 0xE0 { 3 }
+                    else if c & 0xF8 == 0xF0 { 4 }
+                    else { 1 };
 
-            match key.code {
-                KeyCode::Enter => {
-                    let query = input.value().to_string();
-                    if query.is_empty() {
-                        return Ok(TuiResult::Cancelled);
+                let mut utf8_buf = vec![c];
+                for _ in 1..width {
+                    let mut b = [0u8; 1];
+                    if stdin.read(&mut b)? == 1 {
+                        utf8_buf.push(b[0]);
                     }
-                    return Ok(TuiResult::Query(query));
                 }
-                KeyCode::Esc => {
-                    return Ok(TuiResult::Cancelled);
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(TuiResult::Cancelled);
-                }
-                _ => {
-                    // Handle other input events
-                    input.handle_event(&Event::Key(key));
+                if let Ok(s) = std::str::from_utf8(&utf8_buf) {
+                    input_text.push_str(s);
                 }
             }
+            _ => {}
         }
     }
 }
 
 /// Draw the TUI.
-fn draw_ui(frame: &mut Frame, input: &Input) {
+fn draw_ui(frame: &mut Frame, input_text: &str) {
     let size = frame.area();
 
     // Create a centered popup
@@ -118,8 +160,7 @@ fn draw_ui(frame: &mut Frame, input: &Input) {
 
     // Calculate visible portion of input
     let input_width = inner_area.width as usize;
-    let value = input.value();
-    let cursor_pos = input.visual_cursor();
+    let cursor_pos = input_text.chars().count();
 
     // Scroll the input if cursor is beyond visible area
     let scroll = if cursor_pos >= input_width {
@@ -128,7 +169,7 @@ fn draw_ui(frame: &mut Frame, input: &Input) {
         0
     };
 
-    let visible_value: String = value.chars().skip(scroll).take(input_width).collect();
+    let visible_value: String = input_text.chars().skip(scroll).take(input_width).collect();
 
     // Create the input paragraph
     let input_paragraph = Paragraph::new(Line::from(vec![
@@ -137,7 +178,7 @@ fn draw_ui(frame: &mut Frame, input: &Input) {
 
     frame.render_widget(input_paragraph, inner_area);
 
-    // Position the cursor
+    // Position the cursor at end of text
     let cursor_x = inner_area.x + (cursor_pos - scroll) as u16;
     let cursor_y = inner_area.y;
     frame.set_cursor_position((cursor_x, cursor_y));

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "WebSearch",
+      "WebFetch(domain:nathancraddock.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(~/.local/bin/llmcmd daemon status:*)",
+      "Bash(~/.local/bin/llmcmd --pipe)",
+      "Bash(~/.local/bin/llmcmd:*)"
+    ]
+  }
+}

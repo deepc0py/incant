@@ -127,12 +127,17 @@ async fn handle_daemon(action: DaemonAction) -> Result<()> {
 }
 
 /// Start the daemon in the background.
+/// Note: All output goes to stderr to avoid polluting stdout (which may be captured by shell).
 async fn start_daemon() -> Result<()> {
     // Check if already running
     if daemon::server::is_daemon_running().await {
-        println!("Daemon is already running");
+        eprintln!("Daemon is already running");
         return Ok(());
     }
+
+    // Clear any existing startup status file
+    let status_path = config::Config::startup_status_path()?;
+    let _ = std::fs::remove_file(&status_path);
 
     // Get the current executable path
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
@@ -146,19 +151,52 @@ async fn start_daemon() -> Result<()> {
         .spawn()
         .context("Failed to start daemon process")?;
 
-    println!("Daemon started with PID {}", child.id());
+    let pid = child.id();
+    eprintln!("Starting daemon (PID {})...", pid);
 
-    // Wait a moment for it to initialize
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait for startup status (poll the status file)
+    let max_wait = 3000; // 3 seconds max
+    let poll_interval = 100; // 100ms
+    let mut waited = 0;
 
-    // Verify it's running
-    if daemon::server::is_daemon_running().await {
-        println!("Daemon is ready");
-    } else {
-        eprintln!("Warning: Daemon may not have started correctly. Check logs.");
+    while waited < max_wait {
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval)).await;
+        waited += poll_interval;
+
+        // Check if status file exists
+        if let Ok(status) = std::fs::read_to_string(&status_path) {
+            if status.starts_with("OK") {
+                eprintln!("Daemon is ready");
+                return Ok(());
+            } else if status.starts_with("ERROR:") {
+                // Clean up the status file
+                let _ = std::fs::remove_file(&status_path);
+                let error_msg = status.strip_prefix("ERROR: ").unwrap_or(&status);
+                eprintln!("\nDaemon failed to start:\n{}", error_msg);
+                std::process::exit(1);
+            }
+        }
+
+        // Also check if process is still alive
+        // If socket exists and responds, we're good
+        if daemon::server::is_daemon_running().await {
+            eprintln!("Daemon is ready");
+            return Ok(());
+        }
     }
 
-    Ok(())
+    // Timeout - check status file one more time
+    if let Ok(status) = std::fs::read_to_string(&status_path) {
+        let _ = std::fs::remove_file(&status_path);
+        if status.starts_with("ERROR:") {
+            let error_msg = status.strip_prefix("ERROR: ").unwrap_or(&status);
+            eprintln!("\nDaemon failed to start:\n{}", error_msg);
+            std::process::exit(1);
+        }
+    }
+
+    eprintln!("\nDaemon startup timed out. Run 'llmcmd daemon run' to see errors.");
+    std::process::exit(1);
 }
 
 /// Stop the running daemon.
@@ -442,7 +480,8 @@ fn handle_install() -> Result<()> {
     if shell.contains("zsh") {
         println!("Add to ~/.zshrc:\n");
         println!(r#"function _llmcmd_widget() {{
-    local cmd=$(llmcmd)
+    local cmd
+    cmd=$(llmcmd </dev/tty)
     if [[ -n "$cmd" ]]; then
         LBUFFER+="$cmd"
     fi
@@ -453,7 +492,8 @@ bindkey '^k' _llmcmd_widget"#);
     } else if shell.contains("bash") {
         println!("Add to ~/.bashrc:\n");
         println!(r#"_llmcmd_readline() {{
-    local cmd=$(llmcmd)
+    local cmd
+    cmd=$(llmcmd </dev/tty)
     READLINE_LINE="${{READLINE_LINE}}${{cmd}}"
     READLINE_POINT=${{#READLINE_LINE}}
 }}
@@ -461,7 +501,7 @@ bind -x '"\C-k": _llmcmd_readline'"#);
     } else if shell.contains("fish") {
         println!("Add to ~/.config/fish/config.fish:\n");
         println!(r#"function _llmcmd_fish
-    set -l cmd (llmcmd)
+    set -l cmd (llmcmd </dev/tty)
     commandline -i $cmd
 end
 bind \ck _llmcmd_fish"#);

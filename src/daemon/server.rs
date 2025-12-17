@@ -33,6 +33,19 @@ impl DaemonServer {
 
     /// Run the daemon server.
     pub async fn run(&self) -> Result<()> {
+        // Wrap the startup logic to catch and report errors
+        match self.run_inner().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Write error to startup status file
+                let _ = Self::write_startup_status(&format!("ERROR: {:#}", e)).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner run logic that can fail during startup.
+    async fn run_inner(&self) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = self.socket_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -56,7 +69,7 @@ impl DaemonServer {
         info!("Checking backend health...");
         self.backend.health_check().await.with_context(|| {
             format!(
-                "Backend health check failed for {} ({})",
+                "Backend health check failed for {} ({}).\n\nPossible causes:\n  - Ollama is not running (start with: ollama serve)\n  - Wrong API key for cloud backends\n  - Network connectivity issues",
                 self.backend.name(),
                 self.backend.model()
             )
@@ -75,6 +88,9 @@ impl DaemonServer {
 
         // Write PID file
         self.write_pid_file().await?;
+
+        // Write success status
+        Self::write_startup_status("OK").await?;
 
         // Accept connections
         loop {
@@ -107,7 +123,18 @@ impl DaemonServer {
         Ok(())
     }
 
+    /// Write startup status to a file for parent process to read.
+    async fn write_startup_status(status: &str) -> Result<()> {
+        let status_path = Config::startup_status_path()?;
+        if let Some(parent) = status_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&status_path, status).await?;
+        Ok(())
+    }
+
     /// Get the socket path.
+    #[allow(dead_code)]
     pub fn socket_path(&self) -> &PathBuf {
         &self.socket_path
     }
