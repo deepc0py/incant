@@ -1,0 +1,28 @@
+# llmcmd configuration file
+# Copy to ~/.config/llmcmd/config.toml
+
+# Backend configuration
+# Supported types: ollama, anthropic, openai
+[backend]
+type = "ollama"
+model = "qwen2.5-coder:7b"
+host = "http://localhost:11434"
+
+# For Anthropic Claude API:
+# [backend]
+# type = "anthropic"
+# model = "claude-3-5-haiku-latest"
+# api_key = "sk-ant-..." # Or set ANTHROPIC_API_KEY env var
+
+# For OpenAI API:
+# [backend]
+# type = "openai"
+# model = "gpt-4o-mini"
+# api_key = "sk-..." # Or set OPENAI_API_KEY env var
+
+# User preferences for command generation
+[preferences]
+# Prefer modern tools (rg/fd/bat over grep/find/cat)
+modern_tools = true
+# Prefer verbose flags (--recursive over -r)
+verbose_flags = true
