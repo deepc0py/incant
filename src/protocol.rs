@@ -12,6 +12,12 @@ pub struct Request {
     pub query: String,
     /// System context for better command generation.
     pub context: Context,
+    /// Model override (if specified by client).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Temperature override (if specified by client).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
 }
 
 /// System context gathered by the client.
@@ -153,9 +159,31 @@ mod tests {
                 os: "Linux 5.15.0".to_string(),
                 distro: Some("Ubuntu 22.04".to_string()),
             },
+            model: None,
+            temperature: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.query, req.query);
+    }
+
+    #[test]
+    fn test_request_with_model_override() {
+        let req = Request {
+            query: "list files".to_string(),
+            context: Context {
+                cwd: "/home/user".into(),
+                shell: "/bin/zsh".to_string(),
+                os: "Linux 5.15.0".to_string(),
+                distro: None,
+            },
+            model: Some("qwen2.5-coder:1.5b".to_string()),
+            temperature: Some(0.2),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("qwen2.5-coder:1.5b"));
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.model, Some("qwen2.5-coder:1.5b".to_string()));
+        assert_eq!(parsed.temperature, Some(0.2));
     }
 }

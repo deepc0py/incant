@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Main configuration structure.
@@ -12,6 +13,9 @@ pub struct Config {
     /// Backend configuration.
     #[serde(default)]
     pub backend: BackendConfig,
+    /// Named profiles for quick model switching.
+    #[serde(default)]
+    pub profiles: HashMap<String, Profile>,
     /// User preferences.
     #[serde(default)]
     pub preferences: Preferences,
@@ -19,11 +23,45 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".to_string(),
+            Profile {
+                model: "qwen2.5-coder:7b".to_string(),
+                temperature: Some(0.1),
+            },
+        );
+        profiles.insert(
+            "fast".to_string(),
+            Profile {
+                model: "qwen2.5-coder:1.5b".to_string(),
+                temperature: Some(0.1),
+            },
+        );
+        profiles.insert(
+            "heavy".to_string(),
+            Profile {
+                model: "qwen2.5-coder:32b".to_string(),
+                temperature: Some(0.1),
+            },
+        );
+
         Self {
             backend: BackendConfig::default(),
+            profiles,
             preferences: Preferences::default(),
         }
     }
+}
+
+/// A named profile with model and temperature settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    /// The model to use.
+    pub model: String,
+    /// Temperature for generation (0.0-1.0).
+    #[serde(default)]
+    pub temperature: Option<f32>,
 }
 
 /// Backend configuration for LLM providers.
@@ -32,27 +70,27 @@ impl Default for Config {
 pub enum BackendConfig {
     /// Ollama local backend.
     Ollama {
-        /// Model name (default: qwen2.5-coder:7b).
-        #[serde(default = "default_ollama_model")]
-        model: String,
         /// Ollama host URL (default: http://localhost:11434).
         #[serde(default = "default_ollama_host")]
         host: String,
+        /// Default profile name (default: "default").
+        #[serde(default = "default_profile_name")]
+        default_profile: String,
     },
     /// Anthropic Claude API.
     Anthropic {
-        /// Model name (default: claude-3-5-haiku-latest).
-        #[serde(default = "default_anthropic_model")]
-        model: String,
+        /// Default profile name (default: "default").
+        #[serde(default = "default_profile_name")]
+        default_profile: String,
         /// API key (prefer ANTHROPIC_API_KEY env var).
         #[serde(default)]
         api_key: Option<String>,
     },
     /// OpenAI API.
     OpenAI {
-        /// Model name (default: gpt-4o-mini).
-        #[serde(default = "default_openai_model")]
-        model: String,
+        /// Default profile name (default: "default").
+        #[serde(default = "default_profile_name")]
+        default_profile: String,
         /// API key (prefer OPENAI_API_KEY env var).
         #[serde(default)]
         api_key: Option<String>,
@@ -62,26 +100,18 @@ pub enum BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         BackendConfig::Ollama {
-            model: default_ollama_model(),
             host: default_ollama_host(),
+            default_profile: default_profile_name(),
         }
     }
-}
-
-fn default_ollama_model() -> String {
-    "qwen2.5-coder:7b".to_string()
 }
 
 fn default_ollama_host() -> String {
     "http://localhost:11434".to_string()
 }
 
-fn default_anthropic_model() -> String {
-    "claude-3-5-haiku-latest".to_string()
-}
-
-fn default_openai_model() -> String {
-    "gpt-4o-mini".to_string()
+fn default_profile_name() -> String {
+    "default".to_string()
 }
 
 /// User preferences for command generation.
@@ -106,6 +136,79 @@ impl Default for Preferences {
 
 fn default_true() -> bool {
     true
+}
+
+/// Model selection options from CLI.
+#[derive(Debug, Clone, Default)]
+pub struct ModelSelection {
+    /// Explicit model override (highest priority).
+    pub model: Option<String>,
+    /// Profile name to use.
+    pub profile: Option<String>,
+    /// Use the "fast" profile alias.
+    pub fast: bool,
+}
+
+impl ModelSelection {
+    /// Resolve the model to use based on priority:
+    /// --model > --profile/--fast > default_profile > hardcoded fallback
+    pub fn resolve_model(&self, config: &Config) -> String {
+        // Highest priority: explicit --model
+        if let Some(model) = &self.model {
+            return model.clone();
+        }
+
+        // Next: --profile or --fast alias
+        let profile_name = if self.fast {
+            Some("fast".to_string())
+        } else {
+            self.profile.clone()
+        };
+
+        if let Some(name) = profile_name {
+            if let Some(profile) = config.profiles.get(&name) {
+                return profile.model.clone();
+            }
+        }
+
+        // Next: default_profile from backend config
+        let default_profile = config.default_profile();
+        if let Some(profile) = config.profiles.get(default_profile) {
+            return profile.model.clone();
+        }
+
+        // Fallback: hardcoded default based on backend type
+        config.fallback_model().to_string()
+    }
+
+    /// Resolve the temperature to use.
+    pub fn resolve_temperature(&self, config: &Config) -> f32 {
+        // If explicit model, use default temperature
+        if self.model.is_some() {
+            return 0.1;
+        }
+
+        // Check profile
+        let profile_name = if self.fast {
+            Some("fast".to_string())
+        } else {
+            self.profile.clone()
+        };
+
+        if let Some(name) = profile_name {
+            if let Some(profile) = config.profiles.get(&name) {
+                return profile.temperature.unwrap_or(0.1);
+            }
+        }
+
+        // Default profile
+        let default_profile = config.default_profile();
+        if let Some(profile) = config.profiles.get(default_profile) {
+            return profile.temperature.unwrap_or(0.1);
+        }
+
+        0.1
+    }
 }
 
 impl Config {
@@ -179,13 +282,54 @@ impl Config {
         }
     }
 
-    /// Get the model name.
-    pub fn model_name(&self) -> &str {
+    /// Get the default profile name from backend config.
+    pub fn default_profile(&self) -> &str {
         match &self.backend {
-            BackendConfig::Ollama { model, .. } => model,
-            BackendConfig::Anthropic { model, .. } => model,
-            BackendConfig::OpenAI { model, .. } => model,
+            BackendConfig::Ollama { default_profile, .. } => default_profile,
+            BackendConfig::Anthropic { default_profile, .. } => default_profile,
+            BackendConfig::OpenAI { default_profile, .. } => default_profile,
         }
+    }
+
+    /// Get the fallback model for this backend type.
+    pub fn fallback_model(&self) -> &'static str {
+        match &self.backend {
+            BackendConfig::Ollama { .. } => "qwen2.5-coder:7b",
+            BackendConfig::Anthropic { .. } => "claude-3-5-haiku-latest",
+            BackendConfig::OpenAI { .. } => "gpt-4o-mini",
+        }
+    }
+
+    /// Get the model name (from default profile or fallback).
+    pub fn model_name(&self) -> String {
+        let default_profile = self.default_profile();
+        if let Some(profile) = self.profiles.get(default_profile) {
+            profile.model.clone()
+        } else {
+            self.fallback_model().to_string()
+        }
+    }
+
+    /// Get the Ollama host URL.
+    pub fn ollama_host(&self) -> Option<&str> {
+        match &self.backend {
+            BackendConfig::Ollama { host, .. } => Some(host),
+            _ => None,
+        }
+    }
+
+    /// Get the API key for cloud backends.
+    pub fn api_key(&self) -> Option<&str> {
+        match &self.backend {
+            BackendConfig::Anthropic { api_key, .. } => api_key.as_deref(),
+            BackendConfig::OpenAI { api_key, .. } => api_key.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Get all profile names.
+    pub fn profile_names(&self) -> Vec<&String> {
+        self.profiles.keys().collect()
     }
 
     /// Build the system prompt based on context and preferences.
@@ -243,6 +387,8 @@ mod tests {
         let config = Config::default();
         assert!(matches!(config.backend, BackendConfig::Ollama { .. }));
         assert!(config.preferences.modern_tools);
+        assert!(config.profiles.contains_key("default"));
+        assert!(config.profiles.contains_key("fast"));
     }
 
     #[test]
@@ -250,6 +396,7 @@ mod tests {
         let config = Config::default();
         let toml = toml::to_string_pretty(&config).unwrap();
         assert!(toml.contains("ollama"));
+        assert!(toml.contains("profiles"));
     }
 
     #[test]
@@ -257,7 +404,11 @@ mod tests {
         let toml = r#"
 [backend]
 type = "anthropic"
+default_profile = "default"
+
+[profiles.default]
 model = "claude-3-5-haiku-latest"
+temperature = 0.1
 
 [preferences]
 modern_tools = false
@@ -266,5 +417,45 @@ verbose_flags = true
         let config: Config = toml::from_str(toml).unwrap();
         assert!(matches!(config.backend, BackendConfig::Anthropic { .. }));
         assert!(!config.preferences.modern_tools);
+    }
+
+    #[test]
+    fn test_model_selection_explicit_model() {
+        let config = Config::default();
+        let selection = ModelSelection {
+            model: Some("custom-model:latest".to_string()),
+            profile: None,
+            fast: false,
+        };
+        assert_eq!(selection.resolve_model(&config), "custom-model:latest");
+    }
+
+    #[test]
+    fn test_model_selection_fast() {
+        let config = Config::default();
+        let selection = ModelSelection {
+            model: None,
+            profile: None,
+            fast: true,
+        };
+        assert_eq!(selection.resolve_model(&config), "qwen2.5-coder:1.5b");
+    }
+
+    #[test]
+    fn test_model_selection_profile() {
+        let config = Config::default();
+        let selection = ModelSelection {
+            model: None,
+            profile: Some("heavy".to_string()),
+            fast: false,
+        };
+        assert_eq!(selection.resolve_model(&config), "qwen2.5-coder:32b");
+    }
+
+    #[test]
+    fn test_model_selection_default() {
+        let config = Config::default();
+        let selection = ModelSelection::default();
+        assert_eq!(selection.resolve_model(&config), "qwen2.5-coder:7b");
     }
 }

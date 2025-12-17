@@ -22,7 +22,7 @@ impl DaemonServer {
     /// Create a new daemon server.
     pub fn new(config: Config) -> Result<Self> {
         let socket_path = Config::socket_path()?;
-        let backend = create_backend(&config.backend);
+        let backend = create_backend(&config);
 
         Ok(Self {
             config,
@@ -131,8 +131,24 @@ async fn handle_client(
             // Build the system prompt
             let system_prompt = config.build_system_prompt(&request.context);
 
+            // Extract model and temperature overrides from request
+            let model_override = request.model.as_deref();
+            let temperature_override = request.temperature;
+
+            if model_override.is_some() {
+                debug!("Using model override: {:?}", model_override);
+            }
+
             // Generate the command
-            match backend.generate(&system_prompt, &request.query).await {
+            match backend
+                .generate(
+                    &system_prompt,
+                    &request.query,
+                    model_override,
+                    temperature_override,
+                )
+                .await
+            {
                 Ok(command) => {
                     debug!("Generated command: {}", command);
                     Response::success(command)

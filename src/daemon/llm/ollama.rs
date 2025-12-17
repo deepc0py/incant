@@ -29,16 +29,26 @@ impl OllamaBackend {
     }
 
     /// Generate a command from a query and system prompt.
-    pub async fn generate(&self, system_prompt: &str, user_query: &str) -> Result<String> {
+    /// Optionally override the model and temperature for this request.
+    pub async fn generate(
+        &self,
+        system_prompt: &str,
+        user_query: &str,
+        model_override: Option<&str>,
+        temperature_override: Option<f32>,
+    ) -> Result<String> {
         let url = format!("{}/api/generate", self.host);
 
+        let model = model_override.unwrap_or(&self.model);
+        let temperature = temperature_override.unwrap_or(0.1);
+
         let request = OllamaRequest {
-            model: self.model.clone(),
+            model: model.to_string(),
             prompt: user_query.to_string(),
             system: system_prompt.to_string(),
             stream: false,
             options: OllamaOptions {
-                temperature: 0.1, // Low temperature for deterministic commands
+                temperature,
                 num_predict: 200, // Limit output length
             },
         };

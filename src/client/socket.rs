@@ -3,11 +3,16 @@
 use crate::config::Config;
 use crate::protocol::{framing, Context, Message, Request, Response};
 use anyhow::{Context as AnyhowContext, Result};
-use tokio::net::UnixStream;
 use std::time::Duration;
+use tokio::net::UnixStream;
 
 /// Send a query to the daemon and return the generated command.
-pub async fn send_query(query: String, context: Context) -> Result<String> {
+pub async fn send_query(
+    query: String,
+    context: Context,
+    model: Option<String>,
+    temperature: Option<f32>,
+) -> Result<String> {
     let socket_path = Config::socket_path()?;
 
     // Connect with timeout
@@ -24,7 +29,7 @@ pub async fn send_query(query: String, context: Context) -> Result<String> {
         )
     })?;
 
-    send_query_to_stream(stream, query, context).await
+    send_query_to_stream(stream, query, context, model, temperature).await
 }
 
 /// Send a query to an existing stream.
@@ -32,8 +37,15 @@ async fn send_query_to_stream(
     mut stream: UnixStream,
     query: String,
     context: Context,
+    model: Option<String>,
+    temperature: Option<f32>,
 ) -> Result<String> {
-    let request = Request { query, context };
+    let request = Request {
+        query,
+        context,
+        model,
+        temperature,
+    };
     let message = Message::Query(request);
 
     // Send the request
@@ -58,6 +70,7 @@ async fn send_query_to_stream(
 }
 
 /// Check if the daemon is reachable.
+#[allow(dead_code)]
 pub async fn check_daemon() -> Result<()> {
     let socket_path = Config::socket_path()?;
 
@@ -86,7 +99,10 @@ pub async fn check_daemon() -> Result<()> {
     .map_err(|_| anyhow::anyhow!("Status check timeout"))??;
 
     if response.error.is_some() {
-        return Err(anyhow::anyhow!("Daemon returned error: {:?}", response.error));
+        return Err(anyhow::anyhow!(
+            "Daemon returned error: {:?}",
+            response.error
+        ));
     }
 
     Ok(())

@@ -11,6 +11,7 @@ mod protocol;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use config::ModelSelection;
 use std::process::Command as ProcessCommand;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -28,6 +29,18 @@ struct Cli {
     #[arg(long)]
     pipe: bool,
 
+    /// Use the fast profile (smaller, faster model)
+    #[arg(short = 'f', long)]
+    fast: bool,
+
+    /// Use a named profile from config
+    #[arg(short = 'p', long, value_name = "NAME")]
+    profile: Option<String>,
+
+    /// Override model (ignores profile)
+    #[arg(short = 'm', long, value_name = "MODEL")]
+    model: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -43,6 +56,8 @@ enum Commands {
     Config,
     /// Install shell integration
     Install,
+    /// List available profiles
+    Profiles,
 }
 
 #[derive(Subcommand)]
@@ -65,9 +80,16 @@ async fn main() -> Result<()> {
         Some(Commands::Daemon { action }) => handle_daemon(action).await,
         Some(Commands::Config) => handle_config(),
         Some(Commands::Install) => handle_install(),
+        Some(Commands::Profiles) => handle_profiles(),
         None => {
+            // Build model selection from CLI args
+            let model_selection = ModelSelection {
+                model: cli.model,
+                profile: cli.profile,
+                fast: cli.fast,
+            };
             // Client mode - send query to daemon
-            handle_query(cli.query, cli.pipe).await
+            handle_query(cli.query, cli.pipe, model_selection).await
         }
     }
 }
@@ -140,7 +162,8 @@ async fn daemon_status() -> Result<()> {
             println!("PID: {}", pid);
         }
         println!("Backend: {}", config.backend_type());
-        println!("Model: {}", config.model_name());
+        println!("Default model: {}", config.model_name());
+        println!("Default profile: {}", config.default_profile());
         println!(
             "Socket: {}",
             config::Config::socket_path()?.display()
@@ -167,7 +190,7 @@ async fn run_daemon_foreground() -> Result<()> {
 
     let config = config::Config::load().context("Failed to load configuration")?;
     info!(
-        "Using backend: {} ({})",
+        "Using backend: {} (default model: {})",
         config.backend_type(),
         config.model_name()
     );
@@ -250,8 +273,52 @@ bind \ck _llmcmd_fish"#);
     Ok(())
 }
 
+/// Handle the profiles subcommand.
+fn handle_profiles() -> Result<()> {
+    let config = config::Config::load()?;
+
+    println!("Available Profiles");
+    println!("==================\n");
+
+    let default_profile = config.default_profile();
+
+    // Sort profile names for consistent output
+    let mut profile_names: Vec<_> = config.profiles.keys().collect();
+    profile_names.sort();
+
+    for name in profile_names {
+        if let Some(profile) = config.profiles.get(name) {
+            let is_default = name == default_profile;
+            let default_marker = if is_default { " (default)" } else { "" };
+            println!(
+                "  {}{}\n    model: {}\n    temperature: {}\n",
+                name,
+                default_marker,
+                profile.model,
+                profile.temperature.unwrap_or(0.1)
+            );
+        }
+    }
+
+    println!("Usage:");
+    println!("  llmcmd --fast \"query\"           # Use 'fast' profile");
+    println!("  llmcmd --profile heavy \"query\"  # Use 'heavy' profile");
+    println!("  llmcmd --model custom:7b \"query\" # Override model directly");
+
+    Ok(())
+}
+
 /// Handle query mode (TUI or pipe).
-async fn handle_query(query: Option<String>, pipe_mode: bool) -> Result<()> {
+async fn handle_query(
+    query: Option<String>,
+    pipe_mode: bool,
+    model_selection: ModelSelection,
+) -> Result<()> {
+    // Load config to resolve model selection
+    let config = config::Config::load()?;
+    let resolved_model = model_selection.resolve_model(&config);
+    let resolved_temperature = model_selection.resolve_temperature(&config);
+
     // Ensure daemon is running, try to auto-start if not
     if !daemon::server::is_daemon_running().await {
         if pipe_mode {
@@ -289,8 +356,10 @@ async fn handle_query(query: Option<String>, pipe_mode: bool) -> Result<()> {
     // Gather context
     let ctx = context::gather_context()?;
 
-    // Send query to daemon
-    match client::send_query(final_query, ctx).await {
+    // Send query to daemon with model override
+    match client::send_query(final_query, ctx, Some(resolved_model), Some(resolved_temperature))
+        .await
+    {
         Ok(command) => {
             // Output just the command to stdout
             println!("{}", command);

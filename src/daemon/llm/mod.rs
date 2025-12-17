@@ -19,11 +19,27 @@ pub enum Backend {
 
 impl Backend {
     /// Generate a command from a query and system prompt.
-    pub async fn generate(&self, system_prompt: &str, user_query: &str) -> Result<String> {
+    /// Optionally override the model and temperature for this request.
+    pub async fn generate(
+        &self,
+        system_prompt: &str,
+        user_query: &str,
+        model_override: Option<&str>,
+        temperature_override: Option<f32>,
+    ) -> Result<String> {
         match self {
-            Backend::Ollama(b) => b.generate(system_prompt, user_query).await,
-            Backend::Anthropic(b) => b.generate(system_prompt, user_query).await,
-            Backend::OpenAI(b) => b.generate(system_prompt, user_query).await,
+            Backend::Ollama(b) => {
+                b.generate(system_prompt, user_query, model_override, temperature_override)
+                    .await
+            }
+            Backend::Anthropic(b) => {
+                b.generate(system_prompt, user_query, model_override, temperature_override)
+                    .await
+            }
+            Backend::OpenAI(b) => {
+                b.generate(system_prompt, user_query, model_override, temperature_override)
+                    .await
+            }
         }
     }
 
@@ -56,16 +72,19 @@ impl Backend {
 }
 
 /// Create a backend from configuration.
-pub fn create_backend(config: &crate::config::BackendConfig) -> Backend {
-    match config {
-        crate::config::BackendConfig::Ollama { model, host } => {
-            Backend::Ollama(ollama::OllamaBackend::new(model.clone(), host.clone()))
+/// The model is resolved from the default profile in the config.
+pub fn create_backend(config: &crate::config::Config) -> Backend {
+    let model = config.model_name();
+
+    match &config.backend {
+        crate::config::BackendConfig::Ollama { host, .. } => {
+            Backend::Ollama(ollama::OllamaBackend::new(model, host.clone()))
         }
-        crate::config::BackendConfig::Anthropic { model, api_key } => {
-            Backend::Anthropic(anthropic::AnthropicBackend::new(model.clone(), api_key.clone()))
+        crate::config::BackendConfig::Anthropic { api_key, .. } => {
+            Backend::Anthropic(anthropic::AnthropicBackend::new(model, api_key.clone()))
         }
-        crate::config::BackendConfig::OpenAI { model, api_key } => {
-            Backend::OpenAI(openai::OpenAIBackend::new(model.clone(), api_key.clone()))
+        crate::config::BackendConfig::OpenAI { api_key, .. } => {
+            Backend::OpenAI(openai::OpenAIBackend::new(model, api_key.clone()))
         }
     }
 }
