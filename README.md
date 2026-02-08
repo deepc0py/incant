@@ -18,7 +18,7 @@ Every terminal user has the same experience. You know what you want to do. You c
 
 This happens to everyone. Junior devs, staff engineers, sysadmins who've been at it for twenty years. The command-line surface area is enormous and nobody holds all of it in their head. The friction isn't ignorance -- it's the mismatch between how fast you can think and how slow it is to look things up.
 
-incant closes that gap. It knows your OS, your shell, your working directory, and your preferred tools. You describe the intent, it gives you the exact command. No browser, no context switch, no wasted minutes.
+incant closes that gap. It runs as a daemon with your shell context already loaded -- OS, shell, cwd, installed tools. You describe the intent, it returns the exact command. The response comes back in the same terminal where you need it, before you'd have finished typing the URL to search for it.
 
 ## Install
 
@@ -207,14 +207,14 @@ The release binary is built with LTO, single codegen unit, symbol stripping, and
 
 ## Where this is going
 
-incant currently does one thing well: single-command translation. But the architecture -- a persistent daemon with pluggable LLM backends and full shell context -- opens up a lot more:
+incant currently does one thing well: single-command translation. But the architecture -- a persistent daemon with pluggable LLM backends and full shell context -- enables a lot more:
 
-- **Multi-step workflows.** "Set up a new Rust project with CI, a Dockerfile, and a gitignore" becomes a sequence of commands, not one.
-- **Correction learning.** When you edit a generated command before running it, that's a training signal. incant should remember what you actually wanted.
-- **Streaming output.** Long-running inference shouldn't block the TUI. Stream tokens as they arrive.
-- **Deeper shell integration.** Read your shell history, alias definitions, and environment to generate commands that match how *you* work, not how a generic user works.
-- **More backends.** Groq, Mistral, local GGUF models via llama.cpp, anything that speaks an inference protocol.
-- **Pipe chains and composition.** Translate not just single commands but entire pipelines: `"find large log files from last week and compress them"` should produce a working one-liner.
+- **Multi-step workflow generation.** A query like `"set up a new Rust project with CI, a Dockerfile, and a gitignore"` maps to an ordered sequence of commands with dependency awareness -- the daemon already has the context to know what's scaffolded and what's missing.
+- **Correction learning from edits.** The shell widget can diff what incant generated against what you actually ran. Over time, a per-user correction log teaches the system your preferences -- your aliases, your flag style, which tools you actually have installed.
+- **Streaming token output.** The daemon's async Tokio runtime and the length-prefixed socket protocol support chunked responses. The TUI can render partial commands as tokens arrive instead of blocking on full inference.
+- **Shell history and alias awareness.** The context module (`context.rs`) currently gathers OS, shell, and cwd. Extending it to parse `~/.zsh_history`, alias definitions, and environment variables would let the model generate commands that match how *you* work, not how a generic user works.
+- **Backend-agnostic inference.** The `Backend` enum dispatches to Ollama, Anthropic, and OpenAI today. The same pattern extends to Groq, Mistral, or local GGUF models via llama.cpp -- anything that accepts a system prompt and returns text.
+- **Pipeline composition.** `"find large log files from last week and compress them"` should produce a working one-liner with pipes, not a single command. The system prompt already understands the user's shell -- it can generate `find | xargs` vs `fd -x` depending on what's available.
 
 ## Building from Source
 
