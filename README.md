@@ -14,7 +14,11 @@ Natural language to shell commands. Instantly.
 
 ## Why incant?
 
-You know the command exists. You just can't remember if it's `tar -xzf` or `tar -xvf`, whether `find` takes `-name` or `-iname` first, or what the `awk` syntax is for the third column. incant removes that friction entirely. It knows your OS, your shell, your working directory, and your preferred tools.
+Every terminal user has the same experience. You know what you want to do. You can describe it in plain English in about four seconds. But the exact flags, the argument order, the syntax quirks of `find` vs `fd`, `sed` on Linux vs macOS, `tar` with or without the dash -- that's where the flow breaks. You pause. You open a browser tab. You scan three Stack Overflow answers. You copy, paste, adjust. Ninety seconds gone for a command you'll forget again next month.
+
+This happens to everyone. Junior devs, staff engineers, sysadmins who've been at it for twenty years. The command-line surface area is enormous and nobody holds all of it in their head. The friction isn't ignorance -- it's the mismatch between how fast you can think and how slow it is to look things up.
+
+incant closes that gap. It knows your OS, your shell, your working directory, and your preferred tools. You describe the intent, it gives you the exact command. No browser, no context switch, no wasted minutes.
 
 ## Install
 
@@ -200,6 +204,17 @@ The `</dev/tty` redirect is required for the TUI to work inside shell widgets.
 | Daemon memory (idle) | <50MB |
 
 The release binary is built with LTO, single codegen unit, symbol stripping, and panic=abort.
+
+## Where this is going
+
+incant currently does one thing well: single-command translation. But the architecture -- a persistent daemon with pluggable LLM backends and full shell context -- opens up a lot more:
+
+- **Multi-step workflows.** "Set up a new Rust project with CI, a Dockerfile, and a gitignore" becomes a sequence of commands, not one.
+- **Correction learning.** When you edit a generated command before running it, that's a training signal. incant should remember what you actually wanted.
+- **Streaming output.** Long-running inference shouldn't block the TUI. Stream tokens as they arrive.
+- **Deeper shell integration.** Read your shell history, alias definitions, and environment to generate commands that match how *you* work, not how a generic user works.
+- **More backends.** Groq, Mistral, local GGUF models via llama.cpp, anything that speaks an inference protocol.
+- **Pipe chains and composition.** Translate not just single commands but entire pipelines: `"find large log files from last week and compress them"` should produce a working one-liner.
 
 ## Building from Source
 
