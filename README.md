@@ -1,125 +1,98 @@
-# llmcmd
+# incant
 
-A hyper-performant terminal command translator in Rust. Takes natural language input via a minimal TUI popup and outputs the exact shell command — nothing else. Think of it as a portable, terminal-native version of Cursor's Cmd+K, but laser-focused on command generation.
+Natural language to shell commands. Instantly.
 
-## Features
+`incant` is a terminal-native command translator written in Rust. Press **Ctrl+K**, describe what you want, get the exact command. Sub-500ms with local models, under a second with cloud APIs. No copy-paste, no browser, no context switching.
 
-- **Sub-500ms latency** with daemon + client architecture
-- **Minimal TUI** - single-line input popup, no bloat
-- **Multiple backends** - Ollama (local), Anthropic Claude, OpenAI GPT
-- **Shell integration** - Ctrl+K binding for zsh, bash, and fish
-- **Context-aware** - knows your OS, shell, and current directory
+```
+  $ ctrl+k
+  ┌──────────────── llmcmd ────────────────┐
+  │ find rust files modified today          │
+  └────────────────────────────────────────-┘
+  $ fd -e rs --changed-within 1d
+```
+
+## Why incant?
+
+You know the command exists. You just can't remember if it's `tar -xzf` or `tar -xvf`, whether `find` takes `-name` or `-iname` first, or what the `awk` syntax is for the third column. incant removes that friction entirely. It knows your OS, your shell, your working directory, and your preferred tools.
+
+## Install
+
+```bash
+git clone https://github.com/deepc0py/incant.git
+cd incant
+./install.sh
+```
+
+The installer builds from source, sets up a default config, optionally installs [Ollama](https://ollama.ai/) with a local model, and wires up the **Ctrl+K** shell binding.
+
+Requires Rust 1.70+ and one of:
+- **Ollama** -- local models, no API key, fully private (recommended)
+- **Anthropic API key** -- Claude
+- **OpenAI API key** -- GPT
 
 ## Quick Start
 
 ```bash
-# Build and install (will also set up Ollama if needed)
-./install.sh
-
 # Start the daemon
 llmcmd daemon start
 
 # Press Ctrl+K in your shell, or:
-llmcmd "find all rust files modified today"
-# Output: fd -e rs --changed-within 1d
-```
+llmcmd "list all docker containers that exited with an error"
+# docker ps -a --filter "status=exited" --filter "exited=1"
 
-The installer will:
-- Build the binary
-- Set up Ollama (if not installed)
-- Pull the default model
-- Configure shell integration (Ctrl+K)
+llmcmd "compress this directory excluding node_modules"
+# tar --exclude='node_modules' -czf archive.tar.gz .
+
+llmcmd --pipe "disk usage sorted by size" | sh
+# Pipe mode: no TUI, direct output, scriptable
+```
 
 ## Usage
 
-### Interactive Mode (Default)
-
 ```bash
-llmcmd                     # Opens TUI popup
-llmcmd "query here"        # Pre-fills TUI with query
+llmcmd                            # Interactive TUI popup
+llmcmd "query"                    # TUI with pre-filled query
+llmcmd --pipe "query"             # No TUI, direct stdout (for scripting)
+llmcmd --fast "query"             # Use fast profile (smaller/faster model)
+llmcmd --profile heavy "query"    # Use a named profile
+llmcmd --model gpt-4o "query"     # Override model directly
+
+llmcmd daemon start|stop|status   # Daemon lifecycle
+llmcmd models list|pull|remove    # Ollama model management
+llmcmd config                     # Open config in $EDITOR
+llmcmd profiles                   # List available profiles
+llmcmd install                    # Show shell integration setup
 ```
 
-### Pipe Mode
+## Architecture
 
-```bash
-llmcmd --pipe "list files" # No TUI, outputs command directly
+```
+┌───────────────────────────────────────────────┐
+│  llmcmd daemon (long-running)                 │
+│                                               │
+│  - Holds LLM connections + pre-cached prompt  │
+│  - Async Tokio runtime                        │
+│  - Ollama / Anthropic / OpenAI backends       │
+└───────────────────┬───────────────────────────┘
+                    │ Unix domain socket
+                    │ (length-prefixed JSON)
+┌───────────────────┴───────────────────────────┐
+│  llmcmd client                                │
+│                                               │
+│  - Instant startup (<30ms)                    │
+│  - Minimal TUI renders to stderr              │
+│  - Command output to stdout                   │
+└───────────────────────────────────────────────┘
 ```
 
-### Daemon Management
-
-```bash
-llmcmd daemon start        # Start daemon in background
-llmcmd daemon stop         # Stop the daemon
-llmcmd daemon status       # Check if running, show backend info
-llmcmd daemon run          # Run in foreground (for debugging)
-```
-
-### Configuration
-
-```bash
-llmcmd config              # Open config in $EDITOR
-llmcmd install             # Show shell integration setup
-llmcmd profiles            # List available profiles
-```
-
-### Model Management (Ollama)
-
-```bash
-llmcmd models list         # List installed models
-llmcmd models pull <model> # Download a model
-llmcmd models remove <model> # Remove a model
-```
-
-## Shell Integration
-
-The installer will automatically set this up, but you can also add it manually.
-
-Press **Ctrl+K** anywhere in your shell to open the TUI, type your request, and get a command inserted at your cursor.
-
-### Zsh (~/.zshrc)
-
-```zsh
-function _llmcmd_widget() {
-    local cmd
-    cmd=$(llmcmd </dev/tty)
-    if [[ -n "$cmd" ]]; then
-        LBUFFER+="$cmd"
-    fi
-    zle redisplay
-}
-zle -N _llmcmd_widget
-bindkey '^k' _llmcmd_widget
-```
-
-### Bash (~/.bashrc)
-
-```bash
-_llmcmd_readline() {
-    local cmd
-    cmd=$(llmcmd </dev/tty)
-    READLINE_LINE="${READLINE_LINE}${cmd}"
-    READLINE_POINT=${#READLINE_LINE}
-}
-bind -x '"\C-k": _llmcmd_readline'
-```
-
-### Fish (~/.config/fish/config.fish)
-
-```fish
-function _llmcmd_fish
-    set -l cmd (llmcmd </dev/tty)
-    commandline -i $cmd
-end
-bind \ck _llmcmd_fish
-```
-
-> **Note:** The `</dev/tty` redirect is required for the TUI to work correctly in shell widgets.
+The daemon stays warm with LLM connections and a pre-cached system prompt. The client is a thin TUI that sends your query over a Unix socket and prints the result. This split is why it feels instant -- the expensive work (model loading, connection setup) happens once.
 
 ## Configuration
 
-Configuration file: `~/.config/llmcmd/config.toml`
+Config lives at `~/.config/llmcmd/config.toml`. Run `llmcmd config` to edit it.
 
-### Ollama (Default)
+### Ollama (default -- fully local, no API key)
 
 ```toml
 [backend]
@@ -134,99 +107,113 @@ temperature = 0.1
 [profiles.fast]
 model = "qwen2.5-coder:1.5b"
 temperature = 0.1
-
-[preferences]
-modern_tools = true    # prefer rg/fd/bat over grep/find/cat
-verbose_flags = true   # prefer --recursive over -r
 ```
 
-### Anthropic Claude
+### Cloud Backends
 
 ```toml
+# Anthropic
 [backend]
 type = "anthropic"
-default_profile = "default"
-# api_key = "sk-ant-..." # Or set ANTHROPIC_API_KEY env var
+# Set ANTHROPIC_API_KEY env var, or:
+# api_key = "sk-ant-..."
 
 [profiles.default]
 model = "claude-3-5-haiku-latest"
 temperature = 0.1
 ```
 
-### OpenAI
-
 ```toml
+# OpenAI
 [backend]
 type = "openai"
-default_profile = "default"
-# api_key = "sk-..." # Or set OPENAI_API_KEY env var
+# Set OPENAI_API_KEY env var, or:
+# api_key = "sk-..."
 
 [profiles.default]
 model = "gpt-4o-mini"
 temperature = 0.1
 ```
 
-### Using Profiles
+### Preferences
 
+```toml
+[preferences]
+modern_tools = true    # prefer rg/fd/bat over grep/find/cat
+verbose_flags = true   # prefer --recursive over -r
+```
+
+See [`config.example.toml`](config.example.toml) for the full reference.
+
+## Shell Integration
+
+The installer sets this up automatically. Press **Ctrl+K** anywhere in your terminal to open the TUI, type your request, and the generated command is inserted at your cursor.
+
+<details>
+<summary>Manual setup (zsh / bash / fish)</summary>
+
+**Zsh** (`~/.zshrc`):
+```zsh
+function _llmcmd_widget() {
+    local cmd
+    cmd=$(llmcmd </dev/tty)
+    if [[ -n "$cmd" ]]; then
+        LBUFFER+="$cmd"
+    fi
+    zle redisplay
+}
+zle -N _llmcmd_widget
+bindkey '^k' _llmcmd_widget
+```
+
+**Bash** (`~/.bashrc`):
 ```bash
-llmcmd --fast "query"           # Use fast profile (smaller model)
-llmcmd --profile heavy "query"  # Use named profile
-llmcmd --model gpt-4o "query"   # Override model directly
-llmcmd profiles                 # List available profiles
+_llmcmd_readline() {
+    local cmd
+    cmd=$(llmcmd </dev/tty)
+    READLINE_LINE="${READLINE_LINE}${cmd}"
+    READLINE_POINT=${#READLINE_LINE}
+}
+bind -x '"\C-k": _llmcmd_readline'
 ```
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│  llmcmd-daemon                                      │
-│  - Long-running process                             │
-│  - Holds LLM connection                             │
-│  - Listens on unix socket                           │
-│  - Pre-cached system prompt                         │
-└─────────────────────────────────────────────────────┘
-                         ▲
-                         │ Unix domain socket
-                         ▼
-┌─────────────────────────────────────────────────────┐
-│  llmcmd (client)                                    │
-│  - Tiny, instant startup (<30ms)                    │
-│  - Renders minimal TUI input                        │
-│  - Outputs command to stdout                        │
-└─────────────────────────────────────────────────────┘
+**Fish** (`~/.config/fish/config.fish`):
+```fish
+function _llmcmd_fish
+    set -l cmd (llmcmd </dev/tty)
+    commandline -i $cmd
+end
+bind \ck _llmcmd_fish
 ```
 
-## Requirements
+The `</dev/tty` redirect is required for the TUI to work inside shell widgets.
+</details>
 
-- Rust 1.70+
-- One of:
-  - [Ollama](https://ollama.ai/) with a code-focused model (recommended: `qwen2.5-coder:7b`)
-  - Anthropic API key
-  - OpenAI API key
+## Performance
+
+| Metric | Value |
+|---|---|
+| Client startup | <30ms |
+| Query to response (Ollama, warm) | <500ms |
+| Query to response (Claude API) | <1s |
+| Client memory | <10MB |
+| Daemon memory (idle) | <50MB |
+
+The release binary is built with LTO, single codegen unit, symbol stripping, and panic=abort.
 
 ## Building from Source
 
 ```bash
-# Clone the repository
 git clone https://github.com/deepc0py/incant.git
 cd incant
-
-# Build
 cargo build --release
-
-# The binary is at target/release/llmcmd
+# Binary: target/release/llmcmd
 ```
 
-## Performance Targets
-
-| Metric | Target |
-|--------|--------|
-| Client startup to TUI visible | <30ms |
-| Query to response (Ollama, warm) | <500ms |
-| Query to response (Claude API) | <1s |
-| Memory (client) | <10MB |
-| Memory (daemon, idle) | <50MB |
+```bash
+cargo test   # Run tests
+```
 
 ## License
 
-MIT
+Apache-2.0
