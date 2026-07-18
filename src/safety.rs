@@ -224,6 +224,20 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             Some(POWERSHELL_WHAT_IF),
         ),
         Rule::new(
+            "powershell-scheduled-task-change",
+            RiskLevel::Destructive,
+            "registers, removes, or changes a Windows scheduled task",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:register-scheduledtask|unregister-scheduledtask|set-scheduledtask|enable-scheduledtask|disable-scheduledtask)\b['"]?"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "windows-schtasks-change",
+            RiskLevel::Destructive,
+            "creates, deletes, or changes a Windows scheduled task",
+            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*)?schtasks(?:\.exe)?\b[^|;\r\n]*/(?:create|delete|change)\b"],
+            None,
+        ),
+        Rule::new(
             "windows-service-native-change",
             RiskLevel::Destructive,
             "changes, stops, or removes a Windows service",
@@ -405,6 +419,13 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "shuts down or reboots the machine",
             &[r"(^|\s|;|&&\s*)(sudo\s+)?(shutdown|reboot|halt|poweroff)(\s|$|;|&)"],
             None,
+        ),
+        Rule::new(
+            "powershell-remove-item-recursive",
+            RiskLevel::Caution,
+            "recursively removes PowerShell items; double-check the target path",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:remove-item|ri|del|erase|rmdir)\b['"]?[^|;\r\n]*(?:-recurse|-r)\b"#],
+            Some(POWERSHELL_WHAT_IF),
         ),
         Rule::new(
             "powershell-force",
@@ -970,6 +991,105 @@ mod tests {
 
         for (command, rule) in cases {
             assert_flags(command, rule, RiskLevel::Caution);
+        }
+    }
+
+    #[test]
+    fn powershell_recursive_remove_item_is_caution_with_adversarial_syntax() {
+        for command in [
+            "Remove-Item -LiteralPath '.\\cache' -Recurse",
+            "Get-ChildItem .\\cache | DEL -r",
+            "$(& 'rI' -Path '.\\cache' -RECURSE)",
+            "(erase -r '.\\cache')",
+            "rmdir '.\\cache' -r",
+        ] {
+            assert_flags(
+                command,
+                "powershell-remove-item-recursive",
+                RiskLevel::Caution,
+            );
+        }
+
+        assert_not_rule(
+            "Remove-Item -LiteralPath '.\\cache' -Recurse -WhatIf",
+            "powershell-remove-item-recursive",
+        );
+        assert_flags(
+            "Remove-Item -LiteralPath '.\\cache' -Recurse -WhatIf:$false",
+            "powershell-remove-item-recursive",
+            RiskLevel::Caution,
+        );
+        assert_safe("Remove-Item -LiteralPath '.\\single-file'");
+        assert_safe("Write-Output 'Remove-Item C:\\data -Recurse'");
+
+        let registry = assess("ri 'HKLM:\\Software\\Incant' -r");
+        assert_eq!(registry.level, RiskLevel::Destructive);
+        assert!(registry
+            .findings
+            .iter()
+            .any(|finding| finding.rule == "powershell-remove-item-recursive"));
+        assert!(registry
+            .findings
+            .iter()
+            .any(|finding| finding.rule == "powershell-registry-change"));
+    }
+
+    #[test]
+    fn scheduled_task_mutations_are_destructive_and_case_insensitive() {
+        let cases = [
+            "Register-ScheduledTask -TaskName Incant -Action $action",
+            "$(& 'UNREGISTER-SCHEDULEDTASK' -TaskName Incant -Confirm:$false)",
+            "Set-ScheduledTask -TaskName Incant -Trigger $trigger",
+            "Enable-ScheduledTask -TaskName Incant",
+            "Disable-ScheduledTask -TaskName Incant",
+        ];
+        for command in cases {
+            assert_flags(
+                command,
+                "powershell-scheduled-task-change",
+                RiskLevel::Destructive,
+            );
+        }
+
+        for command in [
+            "schtasks.exe /Create /TN Incant /TR diagnostic.exe /SC ONCE /ST 23:59",
+            "SCHTASKS /DELETE /TN Incant /F",
+            "(schtasks.exe /Change /TN Incant /Disable)",
+        ] {
+            assert_flags(command, "windows-schtasks-change", RiskLevel::Destructive);
+        }
+    }
+
+    #[test]
+    fn scheduled_task_whatif_and_read_only_near_misses_are_handled() {
+        for command in [
+            "Register-ScheduledTask -TaskName Incant -Action $action -WhatIf",
+            "Unregister-ScheduledTask -TaskName Incant -WhatIf:$true",
+            "Set-ScheduledTask -TaskName Incant -Trigger $trigger -WhatIf",
+            "Enable-ScheduledTask -TaskName Incant -WhatIf",
+            "Disable-ScheduledTask -TaskName Incant -WhatIf",
+        ] {
+            assert_not_rule(command, "powershell-scheduled-task-change");
+            assert_ne!(assess(command).level, RiskLevel::Destructive);
+        }
+
+        assert_flags(
+            "Disable-ScheduledTask -TaskName Incant -WhatIf:$false",
+            "powershell-scheduled-task-change",
+            RiskLevel::Destructive,
+        );
+        assert_flags(
+            "schtasks.exe /Delete /TN Incant /F -WhatIf",
+            "windows-schtasks-change",
+            RiskLevel::Destructive,
+        );
+        for command in [
+            "Get-ScheduledTask -TaskName Incant",
+            "schtasks.exe /Query /TN Incant /FO LIST",
+            "Write-Output 'Unregister-ScheduledTask -TaskName Incant'",
+            "Write-Output 'schtasks.exe /Delete /TN Incant'",
+        ] {
+            assert_safe(command);
         }
     }
 
