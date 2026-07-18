@@ -300,7 +300,7 @@ pub fn assess(command: &str) -> Assessment {
         .collect();
 
     // Most severe first, so clients can print findings in order.
-    findings.sort_by(|a, b| b.level.cmp(&a.level));
+    findings.sort_by_key(|f| std::cmp::Reverse(f.level));
 
     let level = findings.first().map(|f| f.level).unwrap_or(RiskLevel::Safe);
 
