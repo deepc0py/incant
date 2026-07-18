@@ -225,23 +225,42 @@ async fn explain_command(
         .await
 }
 
-/// Check if the daemon is running.
-pub async fn is_daemon_running() -> bool {
-    let Ok(endpoint) = transport::endpoint() else {
-        return false;
+/// Probe whether the daemon is running.
+///
+/// A missing/refused endpoint is the normal not-running state. Every other
+/// transport failure is reported, and the entire connect/write/read exchange
+/// has one deadline so a wedged same-user server cannot hang lifecycle commands.
+pub async fn probe_daemon_status() -> Result<bool> {
+    const STATUS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let endpoint = transport::endpoint()?;
+    let probe = async {
+        let mut stream = match transport::connect(&endpoint).await {
+            Ok(stream) => stream,
+            Err(error) if endpoint_is_absent(&error) => return Ok(false),
+            Err(error) => return Err(error).context("daemon status probe failed"),
+        };
+        framing::write_message(&mut stream, &Message::Status)
+            .await
+            .context("daemon status probe failed")?;
+        let _: Response = framing::read_message(&mut stream)
+            .await
+            .context("daemon status probe failed")?;
+        Ok(true)
     };
-    let Ok(mut stream) = transport::connect(&endpoint).await else {
-        return false;
-    };
-    if framing::write_message(&mut stream, &Message::Status)
+
+    tokio::time::timeout(STATUS_PROBE_TIMEOUT, probe)
         .await
-        .is_err()
-    {
-        return false;
-    }
-    framing::read_message::<_, Response>(&mut stream)
-        .await
-        .is_ok()
+        .map_err(|_| anyhow::anyhow!("daemon status probe timed out"))?
+}
+
+fn endpoint_is_absent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    })
 }
 
 /// Stop the running daemon.

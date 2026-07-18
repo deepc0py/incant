@@ -142,7 +142,7 @@ async fn handle_daemon(action: DaemonAction) -> Result<()> {
 /// Note: All output goes to stderr to avoid polluting stdout (which may be captured by shell).
 async fn start_daemon() -> Result<()> {
     // Check if already running
-    if daemon::server::is_daemon_running().await {
+    if daemon::server::probe_daemon_status().await? {
         eprintln!("Daemon is already running");
         return Ok(());
     }
@@ -196,7 +196,7 @@ async fn start_daemon() -> Result<()> {
 
         // Also check if process is still alive
         // If socket exists and responds, we're good
-        if daemon::server::is_daemon_running().await {
+        if daemon::server::probe_daemon_status().await? {
             eprintln!("Daemon is ready");
             return Ok(());
         }
@@ -218,7 +218,7 @@ async fn start_daemon() -> Result<()> {
 
 /// Stop the running daemon.
 async fn stop_daemon() -> Result<()> {
-    if !daemon::server::is_daemon_running().await {
+    if !daemon::server::probe_daemon_status().await? {
         println!("Daemon is not running");
         return Ok(());
     }
@@ -230,7 +230,7 @@ async fn stop_daemon() -> Result<()> {
 
 /// Show daemon status.
 async fn daemon_status() -> Result<()> {
-    if daemon::server::is_daemon_running().await {
+    if daemon::server::probe_daemon_status().await? {
         let config = config::Config::load()?;
         let pid = daemon::server::get_daemon_pid().await;
 
@@ -611,7 +611,7 @@ async fn handle_query(
     let resolved_temperature = model_selection.resolve_temperature(&config);
 
     // Ensure daemon is running, try to auto-start if not
-    if !daemon::server::is_daemon_running().await {
+    if !daemon::server::probe_daemon_status().await? {
         if pipe_mode {
             eprintln!("Daemon not running. Start with: incant daemon start");
             std::process::exit(1);
@@ -624,7 +624,7 @@ async fn handle_query(
         // Give it time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-        if !daemon::server::is_daemon_running().await {
+        if !daemon::server::probe_daemon_status().await? {
             eprintln!("Failed to start daemon. Check your configuration.");
             std::process::exit(1);
         }

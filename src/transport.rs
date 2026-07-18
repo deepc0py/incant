@@ -786,19 +786,38 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_pipe_owner_is_verified_before_framing() {
+    async fn windows_pipe_security_and_owner_are_verified_before_framing() {
         use crate::protocol::framing;
+        use tokio::io::AsyncReadExt;
+        use windows_sys::Win32::Security::{ImpersonateAnonymousToken, RevertToSelf};
+        use windows_sys::Win32::System::Threading::GetCurrentThread;
 
         let endpoint = endpoint().unwrap();
         let mut listener = Listener::bind(&endpoint).unwrap();
+        assert_pipe_is_current_user_only(&listener.next);
+
+        let duplicate = match Listener::bind(&endpoint) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate first pipe instance unexpectedly succeeded"),
+        };
+        assert_eq!(
+            duplicate
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
+        );
+
         let server = tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap();
+            assert_pipe_is_current_user_only(&stream);
+            assert_pipe_is_current_user_only(&listener.next);
             let value: String = framing::read_message(&mut stream).await.unwrap();
             framing::write_message(&mut stream, &value).await.unwrap();
         });
         let mut client = connect(&endpoint).await.unwrap();
         // The well-known Everyone SID (S-1-1-0) is valid but cannot be the
-        // accepted owner. This exercises the fail-closed mismatch path.
+        // accepted owner. This directly exercises the fail-closed verifier.
         let everyone_bytes = [1u8, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
         let mut storage = vec![0usize; everyone_bytes.len().div_ceil(size_of::<usize>())];
         // SAFETY: `storage` has at least 12 writable bytes and is SID-aligned.
@@ -821,59 +840,91 @@ mod tests {
         let response: String = framing::read_message(&mut client).await.unwrap();
         assert_eq!(response, "secure");
         server.await.unwrap();
-    }
 
-    #[cfg(windows)]
-    #[test]
-    fn windows_first_pipe_instance_rejects_duplicate_listener() {
-        let endpoint = endpoint().unwrap();
-        let _listener = Listener::bind(&endpoint).unwrap();
-        let duplicate = match Listener::bind(&endpoint) {
-            Err(error) => error,
-            Ok(_) => panic!("duplicate first pipe instance unexpectedly succeeded"),
+        // Build an adversarial live pipe owned by Anonymous while retaining an
+        // allow-GA ACE for the current user. Normal connect must reject its
+        // kernel owner before the server can observe even a frame length byte.
+        let user = CurrentUser::load().unwrap();
+        let mut descriptor =
+            SecurityDescriptor::from_sddl(&format!("O:S-1-5-7D:P(A;;GA;;;{})", user.sid_string))
+                .unwrap();
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.as_mut_ptr(),
+            bInheritHandle: 0,
         };
+        let options = ServerOptions::new();
+        // SAFETY: the pseudo-handle is valid, and attributes points to a live
+        // self-relative descriptor for the duration of CreateNamedPipeW.
+        assert_ne!(unsafe { ImpersonateAnonymousToken(GetCurrentThread()) }, 0);
+        let wrong_owner = unsafe {
+            options
+                .reject_remote_clients(true)
+                .first_pipe_instance(true)
+                .create_with_security_attributes_raw(&endpoint.pipe_name, &mut attributes)
+        };
+        // SAFETY: this thread successfully entered anonymous impersonation.
+        assert_ne!(unsafe { RevertToSelf() }, 0);
+        let mut wrong_owner = wrong_owner.unwrap();
+
+        let observer = tokio::spawn(async move {
+            wrong_owner.connect().await.unwrap();
+            let mut byte = [0; 1];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                wrong_owner.read(&mut byte),
+            )
+            .await
+            .expect("wrong-owner client did not disconnect")
+            .unwrap()
+        });
+        tokio::task::yield_now().await;
+        let mismatch = connect(&endpoint).await.unwrap_err();
+        assert!(mismatch
+            .to_string()
+            .contains("Named-pipe server owner is not the current user"));
         assert_eq!(
-            duplicate
+            mismatch
                 .root_cause()
                 .downcast_ref::<std::io::Error>()
-                .and_then(std::io::Error::raw_os_error),
-            Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            observer.await.unwrap(),
+            0,
+            "client sent framing bytes before rejecting the wrong owner"
         );
     }
 
     #[cfg(windows)]
-    fn assert_current_user_only_acl(path: &Path, directory: bool) {
+    fn assert_current_user_only_descriptor(
+        descriptor: PSECURITY_DESCRIPTOR,
+        owner: PSID,
+        dacl: *mut windows_sys::Win32::Security::ACL,
+        directory: bool,
+    ) {
         use windows_sys::Win32::Foundation::GENERIC_ALL;
-        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::{
-            AclSizeInformation, GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACL,
-            ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE,
+            AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+            ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE,
+            SE_DACL_PROTECTED,
         };
 
         let user = CurrentUser::load().unwrap();
-        let wide = wide_path(path).unwrap();
-        let mut owner: PSID = null_mut();
-        let mut dacl: *mut ACL = null_mut();
-        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: all output pointers are valid and the path is NUL terminated.
-        let status = unsafe {
-            GetNamedSecurityInfoW(
-                wide.as_ptr(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner,
-                null_mut(),
-                &mut dacl,
-                null_mut(),
-                &mut descriptor,
-            )
-        };
-        assert_eq!(status, ERROR_SUCCESS);
-        let _descriptor = LocalAllocation::new(descriptor as HLOCAL).unwrap();
         assert!(!owner.is_null());
         assert!(!dacl.is_null());
         // SAFETY: owner points inside the live descriptor allocation.
         assert_ne!(unsafe { EqualSid(owner, user.sid.as_psid()) }, 0);
+
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor is live and both output pointers are writable.
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
 
         let mut info = ACL_SIZE_INFORMATION::default();
         // SAFETY: dacl points inside the live descriptor and info is writable.
@@ -906,6 +957,55 @@ mod tests {
         } else {
             assert_eq!(inheritance, 0);
         }
+    }
+
+    #[cfg(windows)]
+    fn assert_pipe_is_current_user_only(stream: &NamedPipeServer) {
+        let mut owner: PSID = null_mut();
+        let mut dacl = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: all output pointers are valid and the pipe handle is live.
+        let status = unsafe {
+            GetSecurityInfo(
+                stream.as_raw_handle() as HANDLE,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let _descriptor = LocalAllocation::new(descriptor as HLOCAL).unwrap();
+        assert_current_user_only_descriptor(descriptor, owner, dacl, false);
+    }
+
+    #[cfg(windows)]
+    fn assert_current_user_only_acl(path: &Path, directory: bool) {
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+
+        let wide = wide_path(path).unwrap();
+        let mut owner: PSID = null_mut();
+        let mut dacl = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: all output pointers are valid and the path is NUL terminated.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let _descriptor = LocalAllocation::new(descriptor as HLOCAL).unwrap();
+        assert_current_user_only_descriptor(descriptor, owner, dacl, directory);
     }
 
     #[cfg(windows)]

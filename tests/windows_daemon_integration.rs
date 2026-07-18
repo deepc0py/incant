@@ -178,6 +178,50 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim().to_string()
 }
 
+fn assert_hung_pipe_probe_is_bounded(
+    environment: &TestEnvironment,
+    pipe_name: &str,
+    args: &[&str],
+) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .expect("build Tokio runtime");
+    let _runtime_guard = runtime.enter();
+    let server = ServerOptions::new()
+        .reject_remote_clients(true)
+        .first_pipe_instance(true)
+        .create(pipe_name)
+        .expect("create hung named-pipe server");
+
+    let started = Instant::now();
+    let output = environment.run(args);
+    let elapsed = started.elapsed();
+    drop(server);
+
+    assert!(
+        !output.status.success(),
+        "hung probe unexpectedly succeeded"
+    );
+    assert!(
+        text(&output.stderr).contains("daemon status probe timed out"),
+        "unexpected probe error: {}",
+        text(&output.stderr)
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1500) && elapsed < Duration::from_secs(4),
+        "lifecycle probe returned outside strict bound: {elapsed:?}"
+    );
+    if args == ["daemon", "start"] {
+        assert!(
+            !text(&output.stderr).contains("Starting daemon (PID"),
+            "start spawned a duplicate daemon after a timed-out probe"
+        );
+    }
+}
+
 #[test]
 fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
     let environment = TestEnvironment::new();
@@ -188,8 +232,12 @@ fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
     let status = environment.assert_success(&["daemon", "status"]);
     let status = text(&status.stdout);
     assert!(status.contains("Daemon: running"));
-    assert!(status.contains(r"Endpoint: \\.\pipe\incant-S-1-"));
-
+    let pipe_name = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Endpoint: "))
+        .expect("status includes daemon endpoint")
+        .to_string();
+    assert!(pipe_name.starts_with(r"\\.\pipe\incant-S-1-"));
     let query = environment.assert_success(&["--pipe", "list files"]);
     assert_eq!(text(&query.stdout), "echo windows");
 
@@ -210,6 +258,17 @@ fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
 
     environment.assert_success(&["daemon", "stop"]);
     environment.wait_until_stopped();
+
+    // A live, correctly owned pipe that never answers Status must fail every
+    // lifecycle command on one total deadline. Start must not treat the timeout
+    // as absence and launch a duplicate daemon.
+    for args in [
+        &["daemon", "start"][..],
+        &["daemon", "status"][..],
+        &["daemon", "stop"][..],
+    ] {
+        assert_hung_pipe_probe_is_bounded(&environment, &pipe_name, args);
+    }
 
     // Stale filesystem state must not imply liveness on Windows; named pipes
     // themselves leave no filesystem entry to clean up.
