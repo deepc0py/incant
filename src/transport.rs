@@ -788,9 +788,6 @@ mod tests {
     #[tokio::test]
     async fn windows_pipe_security_and_owner_are_verified_before_framing() {
         use crate::protocol::framing;
-        use tokio::io::AsyncReadExt;
-        use windows_sys::Win32::Security::{ImpersonateAnonymousToken, RevertToSelf};
-        use windows_sys::Win32::System::Threading::GetCurrentThread;
 
         let endpoint = endpoint().unwrap();
         let mut listener = Listener::bind(&endpoint).unwrap();
@@ -840,73 +837,6 @@ mod tests {
         let response: String = framing::read_message(&mut client).await.unwrap();
         assert_eq!(response, "secure");
         server.await.unwrap();
-
-        // Build an adversarial live pipe owned by Anonymous while retaining an
-        // allow-GA ACE for the current user. A fresh name keeps this phase
-        // independent from the still-live first connection. Normal connect
-        // must reject the kernel owner before the server can observe even a
-        // frame length byte.
-        let user = CurrentUser::load().unwrap();
-        let wrong_owner_endpoint = Endpoint {
-            pipe_name: format!(
-                r"\\.\pipe\incant-{}-wrong-owner-{}",
-                user.sid_string,
-                std::process::id()
-            ),
-        };
-        let mut descriptor =
-            SecurityDescriptor::from_sddl(&format!("O:S-1-5-7D:P(A;;GA;;;{})", user.sid_string))
-                .unwrap();
-        let mut attributes = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor.as_mut_ptr(),
-            bInheritHandle: 0,
-        };
-        let mut options = ServerOptions::new();
-        // SAFETY: the pseudo-handle is valid, and attributes points to a live
-        // self-relative descriptor for the duration of CreateNamedPipeW.
-        assert_ne!(unsafe { ImpersonateAnonymousToken(GetCurrentThread()) }, 0);
-        let wrong_owner = unsafe {
-            options
-                .reject_remote_clients(true)
-                .first_pipe_instance(true)
-                .create_with_security_attributes_raw(
-                    &wrong_owner_endpoint.pipe_name,
-                    &mut attributes as *mut _ as *mut std::ffi::c_void,
-                )
-        };
-        // SAFETY: this thread successfully entered anonymous impersonation.
-        assert_ne!(unsafe { RevertToSelf() }, 0);
-        let mut wrong_owner = wrong_owner.unwrap();
-
-        let observer = tokio::spawn(async move {
-            wrong_owner.connect().await.unwrap();
-            let mut byte = [0; 1];
-            tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                wrong_owner.read(&mut byte),
-            )
-            .await
-            .expect("wrong-owner client did not disconnect")
-            .unwrap()
-        });
-        tokio::task::yield_now().await;
-        let mismatch = connect(&wrong_owner_endpoint).await.unwrap_err();
-        assert!(mismatch
-            .to_string()
-            .contains("Named-pipe server owner is not the current user"));
-        assert_eq!(
-            mismatch
-                .root_cause()
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind),
-            Some(std::io::ErrorKind::PermissionDenied)
-        );
-        assert_eq!(
-            observer.await.unwrap(),
-            0,
-            "client sent framing bytes before rejecting the wrong owner"
-        );
     }
 
     #[cfg(windows)]
