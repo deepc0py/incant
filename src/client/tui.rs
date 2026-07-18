@@ -3,6 +3,8 @@
 //! Renders a single-line input prompt similar to `gum input`.
 
 use anyhow::Result;
+#[cfg(windows)]
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -15,9 +17,11 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
-use std::io::{self, Read, Write};
+#[cfg(not(windows))]
+use std::io::Read;
+use std::io::{self, Write};
 
-/// Result of the TUI interaction.
+#[derive(Debug, Eq, PartialEq)]
 pub enum TuiResult {
     /// User submitted a query.
     Query(String),
@@ -53,7 +57,43 @@ pub fn run_tui(initial_query: Option<String>) -> Result<TuiResult> {
     result
 }
 
-/// The main input loop using direct stdin reading (avoids crossterm event system issues on macOS).
+#[derive(Debug, Eq, PartialEq)]
+enum InputCommand {
+    Character(char),
+    Submit,
+    Cancel,
+    Backspace,
+    ClearLine,
+    DeleteWord,
+    Ignore,
+}
+
+fn apply_input_command(input_text: &mut String, command: InputCommand) -> Option<TuiResult> {
+    match command {
+        InputCommand::Character(character) => input_text.push(character),
+        InputCommand::Submit if input_text.is_empty() => return Some(TuiResult::Cancelled),
+        InputCommand::Submit => return Some(TuiResult::Query(std::mem::take(input_text))),
+        InputCommand::Cancel => return Some(TuiResult::Cancelled),
+        InputCommand::Backspace => {
+            input_text.pop();
+        }
+        InputCommand::ClearLine => input_text.clear(),
+        InputCommand::DeleteWord => {
+            let trimmed = input_text.trim_end();
+            if let Some(position) = trimmed.rfind(' ') {
+                input_text.truncate(position + 1);
+            } else {
+                input_text.clear();
+            }
+        }
+        InputCommand::Ignore => {}
+    }
+
+    None
+}
+
+/// The Unix input loop reads stdin directly to avoid crossterm event-system issues on macOS.
+#[cfg(not(windows))]
 fn run_input_loop<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     initial_query: Option<String>,
@@ -63,79 +103,97 @@ fn run_input_loop<W: Write>(
     let mut buf = [0u8; 1];
 
     loop {
-        // Draw the UI
         terminal.draw(|frame| draw_ui(frame, &input_text))?;
 
-        // Read single byte from stdin (in raw mode, we get one byte at a time)
         if stdin.read(&mut buf)? == 0 {
             return Ok(TuiResult::Cancelled);
         }
 
-        match buf[0] {
-            // Enter
-            b'\r' | b'\n' => {
-                if input_text.is_empty() {
-                    return Ok(TuiResult::Cancelled);
-                }
-                return Ok(TuiResult::Query(input_text));
-            }
-            // Escape
-            0x1b => {
-                // Check if it's just Escape or an escape sequence
-                // For simplicity, treat any escape as cancel
-                return Ok(TuiResult::Cancelled);
-            }
-            // Ctrl+C
-            0x03 => {
-                return Ok(TuiResult::Cancelled);
-            }
-            // Backspace (ASCII DEL or BS)
-            0x7f | 0x08 => {
-                input_text.pop();
-            }
-            // Ctrl+U (clear line)
-            0x15 => {
-                input_text.clear();
-            }
-            // Ctrl+W (delete word)
-            0x17 => {
-                // Delete last word
-                let trimmed = input_text.trim_end();
-                if let Some(pos) = trimmed.rfind(' ') {
-                    input_text.truncate(pos + 1);
-                } else {
-                    input_text.clear();
-                }
-            }
-            // Regular printable ASCII
-            c if (0x20..0x7f).contains(&c) => {
-                input_text.push(c as char);
-            }
-            // UTF-8 multi-byte sequences
-            c if c >= 0x80 => {
-                // Determine how many bytes in this UTF-8 character
-                let width = if c & 0xE0 == 0xC0 {
+        let command = match buf[0] {
+            b'\r' | b'\n' => InputCommand::Submit,
+            0x1b | 0x03 => InputCommand::Cancel,
+            0x7f | 0x08 => InputCommand::Backspace,
+            0x15 => InputCommand::ClearLine,
+            0x17 => InputCommand::DeleteWord,
+            byte if (0x20..0x7f).contains(&byte) => InputCommand::Character(byte as char),
+            first_byte if first_byte >= 0x80 => {
+                let width = if first_byte & 0xE0 == 0xC0 {
                     2
-                } else if c & 0xF0 == 0xE0 {
+                } else if first_byte & 0xF0 == 0xE0 {
                     3
-                } else if c & 0xF8 == 0xF0 {
+                } else if first_byte & 0xF8 == 0xF0 {
                     4
                 } else {
                     1
                 };
 
-                let mut utf8_buf = vec![c];
+                let mut utf8_buf = vec![first_byte];
                 for _ in 1..width {
-                    let mut b = [0u8; 1];
-                    if stdin.read(&mut b)? == 1 {
-                        utf8_buf.push(b[0]);
+                    let mut byte = [0u8; 1];
+                    if stdin.read(&mut byte)? == 1 {
+                        utf8_buf.push(byte[0]);
                     }
                 }
-                if let Ok(s) = std::str::from_utf8(&utf8_buf) {
-                    input_text.push_str(s);
+                match std::str::from_utf8(&utf8_buf) {
+                    Ok(character) => {
+                        for character in character.chars() {
+                            if let Some(result) = apply_input_command(
+                                &mut input_text,
+                                InputCommand::Character(character),
+                            ) {
+                                return Ok(result);
+                            }
+                        }
+                        InputCommand::Ignore
+                    }
+                    Err(_) => InputCommand::Ignore,
                 }
             }
-            _ => {}
+            _ => InputCommand::Ignore,
+        };
+
+        if let Some(result) = apply_input_command(&mut input_text, command) {
+            return Ok(result);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_input_loop<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    initial_query: Option<String>,
+) -> Result<TuiResult> {
+    let mut input_text = initial_query.unwrap_or_default();
+
+    loop {
+        terminal.draw(|frame| draw_ui(frame, &input_text))?;
+
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        let command = if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c' | 'C') => InputCommand::Cancel,
+                KeyCode::Char('u' | 'U') => InputCommand::ClearLine,
+                KeyCode::Char('w' | 'W') => InputCommand::DeleteWord,
+                _ => InputCommand::Ignore,
+            }
+        } else {
+            match key.code {
+                KeyCode::Char(character) => InputCommand::Character(character),
+                KeyCode::Enter => InputCommand::Submit,
+                KeyCode::Esc => InputCommand::Cancel,
+                KeyCode::Backspace => InputCommand::Backspace,
+                _ => InputCommand::Ignore,
+            }
+        };
+
+        if let Some(result) = apply_input_command(&mut input_text, command) {
+            return Ok(result);
         }
     }
 }
@@ -229,5 +287,49 @@ mod tests {
         assert_eq!(centered.height, 10);
         assert_eq!(centered.x, 30); // (100 - 40) / 2
         assert_eq!(centered.y, 20); // (50 - 10) / 2
+    }
+
+    #[test]
+    fn input_commands_support_unicode_and_editing() {
+        let mut input = String::from("show rust 🦀  ");
+
+        assert_eq!(
+            apply_input_command(&mut input, InputCommand::DeleteWord),
+            None
+        );
+        assert_eq!(input, "show rust ");
+        assert_eq!(
+            apply_input_command(&mut input, InputCommand::Backspace),
+            None
+        );
+        assert_eq!(
+            apply_input_command(&mut input, InputCommand::Character('界')),
+            None
+        );
+        assert_eq!(input, "show rust界");
+        assert_eq!(
+            apply_input_command(&mut input, InputCommand::ClearLine),
+            None
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn input_commands_submit_or_cancel() {
+        let mut input = String::from("list files");
+        assert_eq!(
+            apply_input_command(&mut input, InputCommand::Submit),
+            Some(TuiResult::Query(String::from("list files")))
+        );
+        assert!(input.is_empty());
+
+        assert_eq!(
+            apply_input_command(&mut input, InputCommand::Submit),
+            Some(TuiResult::Cancelled)
+        );
+        assert_eq!(
+            apply_input_command(&mut input, InputCommand::Cancel),
+            Some(TuiResult::Cancelled)
+        );
     }
 }
