@@ -68,6 +68,23 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --all-targets --locked -- -D warnings
 
+  # Proves the ARM64 MSVC linker/SDK setup on the x64 Windows runner
+  # before a release tag depends on it. A debug build is enough to
+  # surface missing target libs; release is exercised on tag.
+  build-windows-arm64:
+    name: build (aarch64-pc-windows-msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo build --locked --target aarch64-pc-windows-msvc
+
   test:
     name: test (${{ matrix.os }})
     strategy:
