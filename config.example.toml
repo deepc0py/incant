@@ -1,5 +1,5 @@
-# llmcmd configuration file
-# Copy to ~/.config/llmcmd/config.toml
+# incant configuration file
+# Copy to ~/.config/incant/config.toml
 
 # Backend configuration
 # Supported types: ollama, anthropic, openai
@@ -23,7 +23,7 @@ default_profile = "default"
 
 # Model profiles
 # Define different model configurations for different use cases
-# Use with: llmcmd --profile <name> or llmcmd --fast (alias for "fast" profile)
+# Use with: incant --profile <name> or incant --fast (alias for "fast" profile)
 [profiles.default]
 model = "qwen2.5-coder:7b"
 temperature = 0.1

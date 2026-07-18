@@ -21,7 +21,7 @@ pub async fn send_query(
         .map_err(|_| anyhow::anyhow!("Connection timeout - is the daemon running?"))?
         .with_context(|| {
             format!(
-                "Failed to connect to daemon at {}. Start it with: llmcmd daemon start",
+                "Failed to connect to daemon at {}. Start it with: incant daemon start",
                 socket_path.display()
             )
         })?;
@@ -73,7 +73,7 @@ pub async fn check_daemon() -> Result<()> {
 
     if !socket_path.exists() {
         return Err(anyhow::anyhow!(
-            "Daemon socket not found at {}. Start daemon with: llmcmd daemon start",
+            "Daemon socket not found at {}. Start daemon with: incant daemon start",
             socket_path.display()
         ));
     }

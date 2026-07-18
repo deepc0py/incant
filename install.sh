@@ -1,11 +1,11 @@
 #!/bin/bash
-# llmcmd installation script
+# incant installation script
 # Installs the binary and sets up shell integration
 
 set -e
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/llmcmd}"
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/incant}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -35,7 +35,7 @@ check_rust() {
 
 # Build the project
 build_project() {
-    info "Building llmcmd..."
+    info "Building incant..."
     cargo build --release
 }
 
@@ -43,8 +43,8 @@ build_project() {
 install_binary() {
     info "Installing to $INSTALL_DIR..."
     mkdir -p "$INSTALL_DIR"
-    cp target/release/llmcmd "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/llmcmd"
+    cp target/release/incant "$INSTALL_DIR/"
+    chmod +x "$INSTALL_DIR/incant"
 
     # Check if INSTALL_DIR is in PATH
     if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
@@ -76,53 +76,53 @@ setup_shell_integration() {
         zsh)
             shell_config="$HOME/.zshrc"
             integration='
-# llmcmd shell integration
-function _llmcmd_widget() {
+# incant shell integration
+function _incant_widget() {
     local cmd
     # Connect stdin to /dev/tty so TUI can read input
     # stdout is captured, stderr and TUI go to terminal
-    cmd=$(llmcmd </dev/tty)
+    cmd=$(incant </dev/tty)
     if [[ -n "$cmd" ]]; then
         LBUFFER+="$cmd"
     fi
     zle redisplay
 }
-zle -N _llmcmd_widget
-bindkey '"'"'^k'"'"' _llmcmd_widget'
+zle -N _incant_widget
+bindkey '"'"'^k'"'"' _incant_widget'
             ;;
         bash)
             shell_config="$HOME/.bashrc"
             integration='
-# llmcmd shell integration
-_llmcmd_readline() {
+# incant shell integration
+_incant_readline() {
     local cmd
     # Connect stdin to /dev/tty so TUI can read input
-    cmd=$(llmcmd </dev/tty)
+    cmd=$(incant </dev/tty)
     READLINE_LINE="${READLINE_LINE}${cmd}"
     READLINE_POINT=${#READLINE_LINE}
 }
-bind -x '"'"'"\C-k": _llmcmd_readline'"'"''
+bind -x '"'"'"\C-k": _incant_readline'"'"''
             ;;
         fish)
             shell_config="$HOME/.config/fish/config.fish"
             integration='
-# llmcmd shell integration
-function _llmcmd_fish
+# incant shell integration
+function _incant_fish
     # Connect stdin to /dev/tty so TUI can read input
-    set -l cmd (llmcmd </dev/tty)
+    set -l cmd (incant </dev/tty)
     commandline -i $cmd
 end
-bind \ck _llmcmd_fish'
+bind \ck _incant_fish'
             ;;
         *)
             warn "Unknown shell: $shell_name"
-            warn "See 'llmcmd install' for manual shell integration"
+            warn "See 'incant install' for manual shell integration"
             return
             ;;
     esac
 
     # Check if already installed
-    if grep -q "llmcmd shell integration" "$shell_config" 2>/dev/null; then
+    if grep -q "incant shell integration" "$shell_config" 2>/dev/null; then
         info "Shell integration already installed in $shell_config"
         return
     fi
@@ -142,7 +142,7 @@ bind \ck _llmcmd_fish'
         info "Restart your shell or run: source $shell_config"
     else
         info "Skipping shell integration"
-        info "Run 'llmcmd install' later to see manual setup instructions"
+        info "Run 'incant install' later to see manual setup instructions"
     fi
 }
 
@@ -304,7 +304,7 @@ setup_ollama() {
 # Main installation flow
 main() {
     echo "================================"
-    echo "  llmcmd Installation"
+    echo "  incant Installation"
     echo "================================"
     echo ""
 
@@ -320,8 +320,8 @@ main() {
     echo "  Installation Complete!"
     echo "================================"
     echo ""
-    info "Start the daemon: llmcmd daemon start"
-    info "Then press Ctrl+K in your shell to use llmcmd"
+    info "Start the daemon: incant daemon start"
+    info "Then press Ctrl+K in your shell to use incant"
     echo ""
 }
 

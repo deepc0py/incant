@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-llmcmd is a hyper-performant terminal command translator written in Rust. It takes natural language input via a minimal TUI popup and outputs shell commands. The tool uses a daemon + client architecture for sub-500ms latency.
+incant is a hyper-performant terminal command translator written in Rust. It takes natural language input via a minimal TUI popup and outputs shell commands. The tool uses a daemon + client architecture for sub-500ms latency.
 
 ## Build Commands
 
@@ -20,7 +20,7 @@ cargo run --release
 
 # Install locally
 ./install.sh
-# Or manually: cp target/release/llmcmd ~/.local/bin/
+# Or manually: cp target/release/incant ~/.local/bin/
 ```
 
 ## Architecture
@@ -30,7 +30,7 @@ cargo run --release
 The project uses a two-process architecture for performance:
 
 ```
-llmcmd-daemon (long-running)          llmcmd (client)
+incant daemon (long-running)          incant (client)
 ├── Holds LLM connections             ├── Minimal TUI input
 ├── Unix socket listener              ├── Sends queries via socket
 ├── Pre-cached system prompt          └── Outputs command to stdout
@@ -69,22 +69,22 @@ src/
 ## CLI Usage
 
 ```bash
-llmcmd                          # Interactive TUI mode
-llmcmd "query"                  # TUI with pre-filled query
-llmcmd --pipe "query"           # No TUI, direct output
-llmcmd --fast "query"           # Use fast profile
-llmcmd --profile heavy "query"  # Use named profile
-llmcmd --model gpt-4o "query"   # Override model
+incant                          # Interactive TUI mode
+incant "query"                  # TUI with pre-filled query
+incant --pipe "query"           # No TUI, direct output
+incant --fast "query"           # Use fast profile
+incant --profile heavy "query"  # Use named profile
+incant --model gpt-4o "query"   # Override model
 
-llmcmd daemon start|stop|status|run
-llmcmd models list|pull|remove  # Ollama model management
-llmcmd config                   # Open config in $EDITOR
-llmcmd profiles                 # List available profiles
+incant daemon start|stop|status|run
+incant models list|pull|remove  # Ollama model management
+incant config                   # Open config in $EDITOR
+incant profiles                 # List available profiles
 ```
 
 ## Configuration
 
-Config file: `~/.config/llmcmd/config.toml`
+Config file: `~/.config/incant/config.toml`
 
 Supports three backends:
 - **Ollama** (default): Local models, requires Ollama running

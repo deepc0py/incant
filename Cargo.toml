@@ -1,16 +1,17 @@
 [package]
-name = "llmcmd"
+name = "incant"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "A hyper-performant terminal command translator"
-authors = ["llmcmd contributors"]
-license = "MIT"
+authors = ["incant contributors"]
+license = "Apache-2.0"
 repository = "https://github.com/deepc0py/incant"
 keywords = ["cli", "llm", "terminal", "shell", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "llmcmd"
+name = "incant"
 path = "src/main.rs"
 
 [dependencies]

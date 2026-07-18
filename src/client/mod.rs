@@ -1,4 +1,4 @@
-//! Client module for the llmcmd CLI.
+//! Client module for the incant CLI.
 //!
 //! The client is a lightweight process that:
 //! - Renders a minimal TUI input prompt

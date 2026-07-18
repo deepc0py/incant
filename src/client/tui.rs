@@ -154,7 +154,7 @@ fn draw_ui(frame: &mut Frame, input_text: &str) {
 
     // Create the input block
     let block = Block::default()
-        .title(" llmcmd ")
+        .title(" incant ")
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
