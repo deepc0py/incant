@@ -341,13 +341,27 @@ fn normalize_windows_shell(parent_name: &str, comspec: Option<&std::ffi::OsStr>)
     if parent.eq_ignore_ascii_case("cmd") {
         return "cmd".to_string();
     }
-    comspec
-        .and_then(std::ffi::OsStr::to_str)
-        .map(windows_process_stem)
-        .filter(|name| name.eq_ignore_ascii_case("cmd"))
-        .map_or_else(|| parent_name.trim().to_string(), |_| "cmd".to_string())
+    if parent.is_empty() {
+        return comspec
+            .and_then(std::ffi::OsStr::to_str)
+            .map(windows_process_stem)
+            .map_or_else(String::new, normalize_observed_windows_shell);
+    }
+    parent.to_string()
 }
 
+#[cfg(any(windows, test))]
+fn normalize_observed_windows_shell(shell: &str) -> String {
+    if shell.eq_ignore_ascii_case("pwsh") {
+        "pwsh".to_string()
+    } else if shell.eq_ignore_ascii_case("powershell") {
+        "PowerShell".to_string()
+    } else if shell.eq_ignore_ascii_case("cmd") {
+        "cmd".to_string()
+    } else {
+        shell.to_string()
+    }
+}
 /// Git state of `dir`: branch plus dirty/clean, e.g. "branch main, dirty".
 ///
 /// One `git status --porcelain=v2 --branch -uno` call yields both facts.
@@ -462,6 +476,7 @@ mod tests {
         assert!(!ctx.os.is_empty());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_get_shell() {
         let shell = get_shell();
@@ -591,17 +606,17 @@ mod tests {
 
     #[test]
     fn normalizes_supported_windows_shells_without_shell_environment_fallback() {
+        let cmd = Some(std::ffi::OsStr::new(r"C:\Windows\System32\cmd.exe"));
         let cases = [
             ("pwsh", None, "pwsh"),
             ("PwSh.EXE", None, "pwsh"),
             ("powershell.exe", None, "PowerShell"),
             ("CMD.EXE", None, "cmd"),
-            (
-                "WindowsTerminal",
-                Some(std::ffi::OsStr::new(r"C:\Windows\System32\cmd.exe")),
-                "cmd",
-            ),
-            ("nu", None, "nu"),
+            ("WindowsTerminal", cmd, "WindowsTerminal"),
+            ("nu.exe", cmd, "nu"),
+            (r"C:\Tools\nu.exe", None, "nu"),
+            ("", cmd, "cmd"),
+            ("  ", None, ""),
         ];
         for (parent, comspec, expected) in cases {
             assert_eq!(normalize_windows_shell(parent, comspec), expected);

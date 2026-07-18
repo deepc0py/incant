@@ -77,6 +77,7 @@ struct Rule {
     reason: &'static str,
     all: Vec<Regex>,
     unless: Option<Regex>,
+    segment_scoped: bool,
 }
 
 impl Rule {
@@ -87,6 +88,7 @@ impl Rule {
         all: &[&str],
         unless: Option<&str>,
     ) -> Self {
+        let segment_scoped = id.starts_with("powershell-") || id.starts_with("windows-");
         Self {
             id,
             level,
@@ -96,13 +98,204 @@ impl Rule {
                 .map(|p| Regex::new(p).expect("static safety pattern must compile"))
                 .collect(),
             unless: unless.map(|p| Regex::new(p).expect("static safety pattern must compile")),
+            segment_scoped,
         }
     }
 
     fn matches(&self, command: &str) -> bool {
-        self.all.iter().all(|re| re.is_match(command))
-            && self.unless.as_ref().is_none_or(|re| !re.is_match(command))
+        if !self.segment_scoped {
+            return self.all.iter().all(|re| re.is_match(command))
+                && self.unless.as_ref().is_none_or(|re| !re.is_match(command));
+        }
+
+        any_powershell_segment(command, |segment| {
+            let Some(primary_match) = self.all.first().and_then(|re| re.find(segment)) else {
+                return false;
+            };
+            if !self.all[1..].iter().all(|re| re.is_match(segment)) {
+                return false;
+            }
+
+            let invocation = powershell_invocation_scope(segment, primary_match.start());
+            self.unless
+                .as_ref()
+                .is_none_or(|re| !re.is_match(&mask_powershell_non_code(invocation)))
+        })
     }
+}
+
+/// Apply a rule to each PowerShell command segment. Separators inside quoted
+/// strings and escaped separators remain part of the current command.
+fn any_powershell_segment(command: &str, mut predicate: impl FnMut(&str) -> bool) -> bool {
+    let bytes = command.as_bytes();
+    let mut start = 0;
+    let mut index = 0;
+    let mut quote = None;
+
+    while index < bytes.len() {
+        match quote {
+            Some(b'\'') => {
+                if bytes[index] == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+                index += 1;
+            }
+            Some(b'"') => {
+                if bytes[index] == b'`' && index + 1 < bytes.len() {
+                    index += 2;
+                } else {
+                    if bytes[index] == b'"' {
+                        quote = None;
+                    }
+                    index += 1;
+                }
+            }
+            Some(_) => unreachable!("only PowerShell quote bytes are stored"),
+            None => {
+                if bytes[index] == b'`' && index + 1 < bytes.len() {
+                    index += 2;
+                    continue;
+                }
+                if matches!(bytes[index], b'\'' | b'"') {
+                    quote = Some(bytes[index]);
+                    index += 1;
+                    continue;
+                }
+
+                let separator_len = match bytes[index] {
+                    b'\r' => usize::from(bytes.get(index + 1) == Some(&b'\n')) + 1,
+                    b'\n' | b';' => 1,
+                    b'&' if bytes.get(index + 1) == Some(&b'&') => 2,
+                    b'|' => usize::from(bytes.get(index + 1) == Some(&b'|')) + 1,
+                    _ => 0,
+                };
+                if separator_len == 0 {
+                    index += 1;
+                    continue;
+                }
+                if predicate(command[start..index].trim()) {
+                    return true;
+                }
+                index += separator_len;
+                start = index;
+            }
+        }
+    }
+
+    predicate(command[start..].trim())
+}
+
+/// Limit an exception such as `-WhatIf` to the invocation containing the
+/// matched cmdlet. A nested `$(...)` or script block cannot borrow an outer
+/// command's common parameters.
+fn powershell_invocation_scope(segment: &str, match_start: usize) -> &str {
+    let tail = &segment[match_start..];
+    let Some((offset, opener)) = tail
+        .char_indices()
+        .find(|(_, character)| !character.is_ascii_whitespace())
+    else {
+        return tail;
+    };
+    let closer = match opener {
+        '(' => b')',
+        '{' => b'}',
+        _ => return tail,
+    };
+
+    let bytes = tail.as_bytes();
+    let opener = opener as u8;
+    let mut depth = 0;
+    let mut quote = None;
+    let mut index = offset;
+    while index < bytes.len() {
+        match quote {
+            Some(b'\'') => {
+                if bytes[index] == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+            }
+            Some(b'"') => {
+                if bytes[index] == b'`' && index + 1 < bytes.len() {
+                    index += 2;
+                    continue;
+                }
+                if bytes[index] == b'"' {
+                    quote = None;
+                }
+            }
+            Some(_) => unreachable!("only PowerShell quote bytes are stored"),
+            None if bytes[index] == b'`' && index + 1 < bytes.len() => {
+                index += 2;
+                continue;
+            }
+            None if matches!(bytes[index], b'\'' | b'"') => quote = Some(bytes[index]),
+            None if bytes[index] == opener => depth += 1,
+            None if bytes[index] == closer => {
+                depth -= 1;
+                if depth == 0 {
+                    return &tail[..index];
+                }
+            }
+            None => {}
+        }
+        index += 1;
+    }
+    tail
+}
+
+/// Mask quoted strings and comments before looking for common parameters.
+/// Their text is data, not a parameter on the matched invocation.
+fn mask_powershell_non_code(command: &str) -> String {
+    let mut masked = command.as_bytes().to_vec();
+    let mut quote = None;
+    let mut index = 0;
+    while index < masked.len() {
+        match quote {
+            Some(b'\'') => {
+                if masked[index] == b'\'' {
+                    if masked.get(index + 1) == Some(&b'\'') {
+                        masked[index] = b' ';
+                        masked[index + 1] = b' ';
+                        index += 2;
+                        continue;
+                    }
+                    quote = None;
+                } else {
+                    masked[index] = b' ';
+                }
+            }
+            Some(b'"') => {
+                if masked[index] == b'`' && index + 1 < masked.len() {
+                    masked[index] = b' ';
+                    masked[index + 1] = b' ';
+                    index += 2;
+                    continue;
+                }
+                if masked[index] == b'"' {
+                    quote = None;
+                } else {
+                    masked[index] = b' ';
+                }
+            }
+            Some(_) => unreachable!("only PowerShell quote bytes are stored"),
+            None if masked[index] == b'#' => {
+                masked[index..].fill(b' ');
+                break;
+            }
+            None if matches!(masked[index], b'\'' | b'"') => quote = Some(masked[index]),
+            None => {}
+        }
+        index += 1;
+    }
+    String::from_utf8(masked).expect("masking ASCII bytes preserves UTF-8")
 }
 
 // Building blocks reused across rm/chmod rules.
@@ -206,7 +399,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "powershell-registry-change",
             RiskLevel::Destructive,
             "changes or removes Windows registry keys or values",
-            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:remove-item|ri|del|erase|rmdir|remove-itemproperty|rp|clear-item|cli|clear-itemproperty|clp|set-item|si|set-itemproperty|sp|new-item|ni|new-itemproperty|rename-item|rni|move-item|mi|copy-item|cpi)\b['"]?[^|;\r\n]*(?:registry::|hk(?:lm|cu|cr|u|cc):)"#],
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:remove-item|ri|rm|del|erase|rd|rmdir|remove-itemproperty|rp|clear-item|cli|clear-itemproperty|clp|set-item|si|set-itemproperty|sp|new-item|ni|new-itemproperty|rename-item|rni|move-item|mi|copy-item|cpi)\b['"]?[^|;\r\n]*(?:registry::|hk(?:lm|cu|cr|u|cc):)"#],
             Some(POWERSHELL_WHAT_IF),
         ),
         Rule::new(
@@ -424,7 +617,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "powershell-remove-item-recursive",
             RiskLevel::Caution,
             "recursively removes PowerShell items; double-check the target path",
-            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:remove-item|ri|del|erase|rmdir)\b['"]?[^|;\r\n]*(?:-recurse|-r)\b"#],
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:remove-item|ri|rm|del|erase|rd|rmdir)\b['"]?[^|;\r\n]*(?:-recurse|-r)\b"#],
             Some(POWERSHELL_WHAT_IF),
         ),
         Rule::new(
@@ -897,10 +1090,39 @@ mod tests {
                 "pwsh.exe -ExecutionPolicy BYPASS -File repair.ps1",
                 "powershell-execution-policy-bypass",
             ),
+            (
+                "Register-ScheduledTask -TaskName Incant -Action $action",
+                "powershell-scheduled-task-change",
+            ),
+            (
+                "schtasks.exe /Delete /TN Incant /F",
+                "windows-schtasks-change",
+            ),
         ];
 
         for (command, rule) in cases {
             assert_flags(command, rule, RiskLevel::Destructive);
+            for prefix in [
+                "# Requires Administrator\n",
+                "Get-Date\r\n",
+                "Get-Date && ",
+                "Get-Date || ",
+                "Get-Date;",
+                "Get-Date | ",
+            ] {
+                assert_flags(&format!("{prefix}{command}"), rule, RiskLevel::Destructive);
+            }
+        }
+
+        for rule in RULES
+            .iter()
+            .filter(|rule| rule.segment_scoped && rule.level == RiskLevel::Destructive)
+        {
+            assert!(
+                cases.iter().any(|(_, case_rule)| *case_rule == rule.id),
+                "missing boundary coverage for {}",
+                rule.id
+            );
         }
     }
 
@@ -991,7 +1213,54 @@ mod tests {
 
         for (command, rule) in cases {
             assert_flags(command, rule, RiskLevel::Caution);
+            for prefix in [
+                "# preflight\n",
+                "Get-Date\r\n",
+                "Get-Date && ",
+                "Get-Date || ",
+                "Get-Date;",
+                "Get-Date | ",
+            ] {
+                assert_flags(&format!("{prefix}{command}"), rule, RiskLevel::Caution);
+            }
         }
+    }
+
+    #[test]
+    fn powershell_whatif_is_scoped_to_the_matched_invocation() {
+        for command in [
+            "Stop-Service Spooler; Get-Service -WhatIf",
+            "Stop-Service Spooler | Get-Service -WhatIf",
+            "Stop-Service Spooler && Get-Service -WhatIf",
+            "Stop-Service Spooler || Get-Service -WhatIf",
+            "Stop-Service Spooler\nGet-Service -WhatIf",
+            "Stop-Service Spooler\r\nGet-Service -WhatIf",
+            "Stop-Service -Name '-WhatIf'",
+            "Stop-Service Spooler # -WhatIf",
+            "Write-Output -WhatIf $(Stop-Service Spooler)",
+            "Write-Output $(Stop-Service Spooler) -WhatIf",
+            "Remove-Item -Path HKLM:\\Software\\Incant; Get-Item -WhatIf",
+        ] {
+            assert_flags(
+                command,
+                if command.contains("Remove-Item") {
+                    "powershell-registry-change"
+                } else {
+                    "powershell-service-change"
+                },
+                RiskLevel::Destructive,
+            );
+        }
+
+        assert_not_rule(
+            "Write-Output $(Stop-Service Spooler -WhatIf)",
+            "powershell-service-change",
+        );
+        assert_flags(
+            "pnputil.exe /delete-driver oem42.inf /uninstall; Get-PnpDevice -WhatIf",
+            "windows-pnputil-change",
+            RiskLevel::Destructive,
+        );
     }
 
     #[test]
@@ -1002,6 +1271,12 @@ mod tests {
             "$(& 'rI' -Path '.\\cache' -RECURSE)",
             "(erase -r '.\\cache')",
             "rmdir '.\\cache' -r",
+            "rm '.\\cache' -Recurse",
+            "rd '.\\cache' -r",
+            "# inventory only\r\nrm '.\\cache' -Recurse",
+            "Get-ChildItem && rd '.\\cache' -r",
+            "Get-ChildItem || rm '.\\cache' -r",
+            "Get-ChildItem; Remove-Item '.\\cache' -Recurse",
         ] {
             assert_flags(
                 command,
@@ -1022,16 +1297,18 @@ mod tests {
         assert_safe("Remove-Item -LiteralPath '.\\single-file'");
         assert_safe("Write-Output 'Remove-Item C:\\data -Recurse'");
 
-        let registry = assess("ri 'HKLM:\\Software\\Incant' -r");
-        assert_eq!(registry.level, RiskLevel::Destructive);
-        assert!(registry
-            .findings
-            .iter()
-            .any(|finding| finding.rule == "powershell-remove-item-recursive"));
-        assert!(registry
-            .findings
-            .iter()
-            .any(|finding| finding.rule == "powershell-registry-change"));
+        for alias in ["ri", "rm", "rd"] {
+            let registry = assess(&format!("{alias} 'HKLM:\\Software\\Incant' -r"));
+            assert_eq!(registry.level, RiskLevel::Destructive);
+            assert!(registry
+                .findings
+                .iter()
+                .any(|finding| finding.rule == "powershell-remove-item-recursive"));
+            assert!(registry
+                .findings
+                .iter()
+                .any(|finding| finding.rule == "powershell-registry-change"));
+        }
     }
 
     #[test]
