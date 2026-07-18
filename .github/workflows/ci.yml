@@ -85,6 +85,40 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --locked --target aarch64-pc-windows-msvc
 
+  # Runs the Windows installer's Pester suite under pwsh 7.4+. The suite
+  # lands with the installer branch; until it merges this job fails,
+  # matching the dependency already accepted for the Windows test lane.
+  # windows-latest ships Pester 5; a missing module is a hard failure,
+  # never an unpinned install from the gallery.
+  pester-windows:
+    name: pester (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run installer Pester suite
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion -lt [version] '7.4') {
+              throw "pwsh 7.4+ required; runner has $($PSVersionTable.PSVersion)."
+          }
+          $pester = Get-Module -ListAvailable -Name Pester |
+              Where-Object { $_.Version -ge [version] '5.0' } |
+              Sort-Object -Property Version -Descending |
+              Select-Object -First 1
+          if ($null -eq $pester) {
+              throw 'Pester 5 is not available on this runner; refusing to install an unpinned fallback.'
+          }
+          Import-Module Pester -MinimumVersion 5.0
+          $result = Invoke-Pester -Path tests/install.Tests.ps1 -Output Detailed -PassThru
+          if ($result.TotalCount -eq 0) {
+              throw 'Pester discovered no tests in tests/install.Tests.ps1.'
+          }
+          if ($result.FailedCount -ne 0) {
+              throw "Pester: $($result.FailedCount) of $($result.TotalCount) tests failed."
+          }
+
   test:
     name: test (${{ matrix.os }})
     strategy:
