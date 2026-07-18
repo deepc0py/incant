@@ -32,7 +32,7 @@ toml = "1.1"
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client for LLM APIs
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # Utility
 dirs = "6"
