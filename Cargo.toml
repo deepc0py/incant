@@ -18,9 +18,9 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full", "net", "io-util", "sync", "time", "fs"] }
 
 # TUI
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
-tui-input = "0.11"
+tui-input = "0.15"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
