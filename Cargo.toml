@@ -45,6 +45,7 @@ libc = "0.2"
 # Async utilities
 futures = "0.3"
 async-trait = "0.1"
+regex = "1"
 
 [profile.release]
 lto = true
