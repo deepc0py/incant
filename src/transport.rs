@@ -907,12 +907,12 @@ mod tests {
         dacl: *mut windows_sys::Win32::Security::ACL,
         directory: bool,
     ) {
-        use windows_sys::Win32::Foundation::GENERIC_ALL;
         use windows_sys::Win32::Security::{
             AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
             ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE,
             SE_DACL_PROTECTED,
         };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
         let user = CurrentUser::load().unwrap();
         assert!(!owner.is_null());
@@ -949,7 +949,9 @@ mod tests {
         // SAFETY: the only ACE was authored as ACCESS_ALLOWED_ACE in our SDDL.
         let ace = unsafe { &*(raw_ace as *const ACCESS_ALLOWED_ACE) };
         assert_eq!(ace.Header.AceType, 0);
-        assert_eq!(ace.Mask, GENERIC_ALL);
+        // The object manager maps SDDL GA to the file/pipe-specific all-access
+        // mask when the descriptor is attached to a kernel object.
+        assert_eq!(ace.Mask, FILE_ALL_ACCESS);
         let trustee = std::ptr::addr_of!(ace.SidStart) as PSID;
         // SAFETY: SidStart begins the variable-length SID within this ACE.
         assert_ne!(unsafe { EqualSid(trustee, user.sid.as_psid()) }, 0);
