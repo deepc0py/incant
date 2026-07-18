@@ -328,28 +328,6 @@ impl Config {
         }
     }
 
-    /// Get the Ollama host URL.
-    pub fn ollama_host(&self) -> Option<&str> {
-        match &self.backend {
-            BackendConfig::Ollama { host, .. } => Some(host),
-            _ => None,
-        }
-    }
-
-    /// Get the API key for cloud backends.
-    pub fn api_key(&self) -> Option<&str> {
-        match &self.backend {
-            BackendConfig::Anthropic { api_key, .. } => api_key.as_deref(),
-            BackendConfig::OpenAI { api_key, .. } => api_key.as_deref(),
-            _ => None,
-        }
-    }
-
-    /// Get all profile names.
-    pub fn profile_names(&self) -> Vec<&String> {
-        self.profiles.keys().collect()
-    }
-
     /// Build the system prompt based on context and preferences.
     pub fn build_system_prompt(&self, context: &crate::protocol::Context) -> String {
         let modern_tools_note = if self.preferences.modern_tools {

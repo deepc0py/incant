@@ -320,7 +320,7 @@ async fn list_models(host: &str) -> Result<()> {
                 let size = model
                     .get("size")
                     .and_then(|s| s.as_u64())
-                    .map(|s| format_size(s))
+                    .map(format_size)
                     .unwrap_or_else(|| "?".to_string());
                 let modified = model
                     .get("modified_at")

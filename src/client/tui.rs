@@ -108,7 +108,7 @@ fn run_input_loop<W: Write>(
                 }
             }
             // Regular printable ASCII
-            c if c >= 0x20 && c < 0x7f => {
+            c if (0x20..0x7f).contains(&c) => {
                 input_text.push(c as char);
             }
             // UTF-8 multi-byte sequences
