@@ -71,7 +71,7 @@ pub fn gather_context() -> Result<Context> {
     let (shell, windows, tools) = {
         let path_tools = probe_windows_path();
         let (shell, windows) =
-            gather_windows_context(path_tools.powershell, path_tools.diagnostic_tools)?;
+            gather_windows_context(path_tools.pwsh, path_tools.diagnostic_tools)?;
         (shell, windows, path_tools.modern_tools)
     };
     #[cfg(not(windows))]
@@ -152,7 +152,7 @@ fn probe_tools() -> Vec<String> {
 struct WindowsPathTools {
     modern_tools: Vec<String>,
     diagnostic_tools: Vec<String>,
-    powershell: Option<&'static str>,
+    pwsh: Option<&'static str>,
 }
 
 #[cfg(windows)]
@@ -167,7 +167,6 @@ fn probe_windows_path() -> WindowsPathTools {
 fn probe_windows_path_in(path: &std::ffi::OsStr) -> WindowsPathTools {
     let mut modern = HashSet::new();
     let mut diagnostic = HashSet::new();
-    let mut windows_powershell = false;
     for dir in std::env::split_paths(path) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
@@ -180,8 +179,6 @@ fn probe_windows_path_in(path: &std::ffi::OsStr) -> WindowsPathTools {
             }
             if WINDOWS_DIAGNOSTIC_TOOLS.contains(&name.as_str()) {
                 diagnostic.insert(name);
-            } else if name == "powershell.exe" {
-                windows_powershell = true;
             }
         }
     }
@@ -191,13 +188,10 @@ fn probe_windows_path_in(path: &std::ffi::OsStr) -> WindowsPathTools {
         .filter(|tool| diagnostic.contains(**tool))
         .map(|tool| (*tool).to_string())
         .collect();
-    let powershell = if diagnostic_tools.iter().any(|tool| tool == "pwsh.exe") {
-        Some("pwsh.exe")
-    } else if windows_powershell {
-        Some("powershell.exe")
-    } else {
-        None
-    };
+    let pwsh = diagnostic_tools
+        .iter()
+        .any(|tool| tool == "pwsh.exe")
+        .then_some("pwsh.exe");
     WindowsPathTools {
         modern_tools: PROBED_TOOLS
             .iter()
@@ -205,19 +199,28 @@ fn probe_windows_path_in(path: &std::ffi::OsStr) -> WindowsPathTools {
             .map(|tool| (*tool).to_string())
             .collect(),
         diagnostic_tools,
-        powershell,
+        pwsh,
     }
+}
+#[cfg(any(windows, test))]
+fn require_pwsh(pwsh: Option<&'static str>) -> Result<&'static str> {
+    let Some(pwsh) = pwsh else {
+        bail!("pwsh 7.4+ is required on Windows; pwsh.exe was not found on PATH");
+    };
+    Ok(pwsh)
 }
 
 #[cfg(windows)]
 fn gather_windows_context(
-    powershell: Option<&'static str>,
+    pwsh: Option<&'static str>,
     diagnostic_tools: Vec<String>,
 ) -> Result<(String, Option<WindowsContext>)> {
-    let powershell =
-        powershell.context("Windows context requires pwsh.exe or powershell.exe on PATH")?;
+    let pwsh = require_pwsh(pwsh)?;
     let script = r#"
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+if ([Version]$PSVersionTable.PSVersion.ToString() -lt [Version]'7.4') {
+    throw "pwsh 7.4+ is required"
+}
 $targetPid = [uint32]$args[0]
 $os = Get-CimInstance -ClassName Win32_OperatingSystem
 $target = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $targetPid"
@@ -227,7 +230,7 @@ $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 [Console]::Out.Write(('{0}`t{1}`t{2}`t{3}`t{4}`t{5}' -f $os.Caption, $os.Version, $os.BuildNumber, $PSVersionTable.PSVersion, $elevated, $parentName))
 "#;
-    let output = std::process::Command::new(powershell)
+    let output = std::process::Command::new(pwsh)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -237,10 +240,10 @@ $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adminis
         ])
         .arg(std::process::id().to_string())
         .output()
-        .with_context(|| format!("failed to collect Windows context with {powershell}"))?;
+        .with_context(|| format!("failed to collect Windows context with {pwsh}"))?;
     if !output.status.success() {
         bail!(
-            "{powershell} failed to collect Windows context: {}",
+            "{pwsh} failed to collect Windows context: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -248,6 +251,35 @@ $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adminis
     let parsed = parse_windows_context(&text, diagnostic_tools)?;
     let shell = normalize_windows_shell(&parsed.0, std::env::var_os("COMSPEC").as_deref());
     Ok((shell, Some(parsed.1)))
+}
+
+#[cfg(any(windows, test))]
+fn validate_pwsh_version(version: &str) -> Result<()> {
+    let version = version.trim();
+    let mut components = version.split('.');
+    let parse_component = |component: Option<&str>| {
+        component
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let (Some(major), Some(minor)) = (
+        parse_component(components.next()),
+        parse_component(components.next()),
+    ) else {
+        bail!("pwsh 7.4+ is required; reported version {version:?} is malformed");
+    };
+
+    let mut extra_components = 0;
+    for component in components {
+        extra_components += 1;
+        if extra_components > 2 || component.parse::<u64>().is_err() {
+            bail!("pwsh 7.4+ is required; reported version {version:?} is malformed");
+        }
+    }
+    if major < 7 || (major == 7 && minor < 4) {
+        bail!("pwsh 7.4+ is required; found {version}");
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
@@ -259,6 +291,8 @@ fn parse_windows_context(
     if fields.len() != 6 || fields[..5].iter().any(|value| value.trim().is_empty()) {
         bail!("PowerShell returned incomplete Windows context");
     }
+    let powershell_version = fields[3].trim();
+    validate_pwsh_version(powershell_version)?;
     let elevated = match fields[4].trim() {
         value if value.eq_ignore_ascii_case("true") => true,
         value if value.eq_ignore_ascii_case("false") => false,
@@ -270,7 +304,7 @@ fn parse_windows_context(
             caption: fields[0].trim().to_string(),
             version: fields[1].trim().to_string(),
             build: fields[2].trim().to_string(),
-            powershell_version: fields[3].trim().to_string(),
+            powershell_version: powershell_version.to_string(),
             elevated,
             diagnostic_tools,
         },
@@ -594,6 +628,52 @@ mod tests {
                 "pnputil.exe".to_string()
             ]
         );
-        assert_eq!(tools.powershell, Some("pwsh.exe"));
+        assert_eq!(tools.pwsh, Some("pwsh.exe"));
+    }
+
+    #[test]
+    fn windows_path_probe_never_selects_legacy_windows_powershell() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("powershell.exe"), "").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let tools = probe_windows_path_in(&path);
+        assert_eq!(tools.pwsh, None);
+        assert!(tools.diagnostic_tools.is_empty());
+    }
+
+    #[test]
+    fn executable_selection_requires_pwsh() {
+        assert_eq!(require_pwsh(Some("pwsh.exe")).unwrap(), "pwsh.exe");
+        let error = require_pwsh(None).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "pwsh 7.4+ is required on Windows; pwsh.exe was not found on PATH"
+        );
+    }
+
+    #[test]
+    fn pwsh_version_enforces_7_4_boundary_numerically() {
+        for accepted in ["7.4", "7.4.0", "7.10.2", "8.0", "10.1.2.3"] {
+            assert!(
+                validate_pwsh_version(accepted).is_ok(),
+                "{accepted:?} should be accepted"
+            );
+        }
+        for rejected in [
+            "5.1",
+            "7.3",
+            "7.3.99",
+            "",
+            "7",
+            "seven.four",
+            "7.4-preview",
+            "7.4.1.2.3",
+        ] {
+            let error = validate_pwsh_version(rejected).unwrap_err().to_string();
+            assert!(
+                error.contains("pwsh 7.4+ is required"),
+                "unexpected error for {rejected:?}: {error}"
+            );
+        }
     }
 }
