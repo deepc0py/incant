@@ -10,6 +10,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual runs keep the Windows lane reproducible against local VM checks.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -38,6 +40,23 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Separate job (not a matrix on `clippy`) so the existing required
+  # status-check context "clippy" keeps its name. Lints the
+  # cfg(windows) code paths, which never compile on the Linux lane.
+  clippy-windows:
+    name: clippy (windows-latest)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
