@@ -1,7 +1,7 @@
-# Release automation: pushing a v* tag builds binaries for four targets,
-# smoke-tests each one, and publishes a GitHub Release with SHA-256
-# checksums. Actions pinned to full commit SHAs; only the publish job
-# holds a write token.
+# Release automation: pushing a v* tag builds binaries for five targets
+# (tarballs for Linux/macOS, a zip for Windows), smoke-tests each one,
+# and publishes a GitHub Release with SHA-256 checksums. Actions pinned
+# to full commit SHAs; only the publish job holds a write token.
 
 name: Release
 
@@ -30,6 +30,8 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -46,12 +48,25 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Smoke test
-        # Every target runs natively on its runner (x86_64-apple-darwin
+      - name: Smoke test (Unix)
+        # Every Unix target runs natively on its runner (x86_64-apple-darwin
         # via Rosetta 2 on the arm64 macOS runner).
+        if: runner.os != 'Windows'
         run: ./target/${{ matrix.target }}/release/incant --version
 
-      - name: Package
+      # The Windows binary must answer from both supported entry points.
+      - name: Smoke test (pwsh)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& ./target/${{ matrix.target }}/release/incant.exe --version'
+
+      - name: Smoke test (CMD)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: target\${{ matrix.target }}\release\incant.exe --version
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           version="${GITHUB_REF_NAME#v}"
           name="incant-${version}-${{ matrix.target }}"
@@ -61,12 +76,30 @@ jobs:
           tar -czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
 
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $name = "incant-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/incant.exe" -Destination $name
+          Copy-Item README.md, LICENSE, CHANGELOG.md, SECURITY.md, config.example.toml -Destination $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          # shasum-compatible checksum line (lowercase hash, two spaces, bare
+          # file name, LF) so the Linux publish job concatenates every
+          # *.sha256 file verbatim into SHA256SUMS.
+          $hash = (Get-FileHash -Algorithm SHA256 -Path "$name.zip").Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText("$name.zip.sha256", "$hash  $name.zip`n")
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.target }}
           path: |
             incant-*.tar.gz
             incant-*.tar.gz.sha256
+            incant-*.zip
+            incant-*.zip.sha256
           if-no-files-found: error
 
   publish:
@@ -92,6 +125,7 @@ jobs:
         with:
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
