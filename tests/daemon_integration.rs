@@ -16,6 +16,7 @@ use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A canned-response mock Ollama server.
@@ -24,26 +25,37 @@ use std::time::{Duration, Instant};
 /// /api/generate` answers with the configured status and body.
 struct MockOllama {
     port: u16,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl MockOllama {
     fn start(generate_status: u16, generate_body: String) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let body = generate_body.clone();
+                let requests = Arc::clone(&server_requests);
                 std::thread::spawn(move || {
-                    let _ = serve_one(&mut stream, generate_status, &body);
+                    let _ = serve_one(&mut stream, generate_status, &body, &requests);
                 });
             }
         });
-        Self { port }
+        Self { port, requests }
     }
 
     fn host(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn generate_requests(&self) -> Vec<serde_json::Value> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -52,6 +64,7 @@ fn serve_one(
     stream: &mut std::net::TcpStream,
     generate_status: u16,
     generate_body: &str,
+    requests: &Mutex<Vec<serde_json::Value>>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
@@ -78,18 +91,25 @@ fn serve_one(
                 .map(|v| v.trim().parse().unwrap_or(0))
         })
         .unwrap_or(0);
-    let mut body_read = buf.len() - header_end;
-    while body_read < content_length {
+    let mut request_body = buf[header_end..].to_vec();
+    while request_body.len() < content_length {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
             break;
         }
-        body_read += n;
+        request_body.extend_from_slice(&chunk[..n]);
     }
+    request_body.truncate(content_length);
 
     let (status, body) = if request_line.starts_with("GET /api/tags") {
         (200u16, r#"{"models":[{"name":"mock-model"}]}"#.to_string())
     } else if request_line.starts_with("POST /api/generate") {
+        if let Ok(request) = serde_json::from_slice(&request_body) {
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+        }
         (generate_status, generate_body.to_string())
     } else {
         (404, r#"{"error":"not found"}"#.to_string())
@@ -111,7 +131,7 @@ struct DaemonFixture {
     home: tempfile::TempDir,
     runtime_dir: PathBuf,
     socket_path: PathBuf,
-    _mock: MockOllama,
+    mock: MockOllama,
 }
 
 impl DaemonFixture {
@@ -151,7 +171,7 @@ impl DaemonFixture {
             home,
             runtime_dir,
             socket_path,
-            _mock: mock,
+            mock,
         };
         fixture.wait_for_socket();
         fixture
@@ -178,17 +198,34 @@ impl DaemonFixture {
 
     /// One query round-trip; returns the raw response JSON.
     fn query(&self, query: &str, explain: bool) -> serde_json::Value {
+        self.query_with_context(
+            query,
+            explain,
+            serde_json::json!({"cwd": "/tmp", "shell": "/bin/sh", "os": "TestOS 1.0"}),
+        )
+    }
+
+    fn query_with_context(
+        &self,
+        query: &str,
+        explain: bool,
+        context: serde_json::Value,
+    ) -> serde_json::Value {
         let mut stream = self.connect();
         write_frame(
             &mut stream,
             &serde_json::json!({
                 "type": "query",
                 "query": query,
-                "context": {"cwd": "/tmp", "shell": "/bin/sh", "os": "TestOS 1.0"},
+                "context": context,
                 "explain": explain,
             }),
         );
         read_frame(&mut stream)
+    }
+
+    fn generate_requests(&self) -> Vec<serde_json::Value> {
+        self.mock.generate_requests()
     }
 }
 
@@ -234,6 +271,74 @@ fn generates_command_end_to_end() {
     assert_eq!(resp["command"], "ls -la");
     assert_eq!(resp["risk"]["level"], "safe");
     assert!(resp.get("error").is_none());
+}
+
+#[test]
+fn windows_policy_reaches_backend_for_representative_requests() {
+    let daemon = DaemonFixture::start(200, r#"{"response":"Get-Date","done":true}"#);
+    let context = serde_json::json!({
+        "cwd": "C:\\work\\incant",
+        "shell": "pwsh",
+        "os": "Microsoft Windows 11 Pro 10.0.26100 (build 26100)",
+        "windows": {
+            "caption": "Microsoft Windows 11 Pro",
+            "version": "10.0.26100",
+            "build": "26100",
+            "powershell_version": "7.4.6",
+            "elevated": false,
+            "diagnostic_tools": [
+                "pwsh.exe",
+                "pnputil.exe",
+                "dism.exe",
+                "sfc.exe"
+            ]
+        }
+    });
+    let cases = [
+        (
+            "show installed graphics adapters and signed driver versions",
+            "Use Get-PnpDevice and pnputil.exe for devices and drivers",
+        ),
+        (
+            "show display-driver errors from the System event log in the last hour",
+            "Use Get-WinEvent with -FilterHashtable for event logs",
+        ),
+        (
+            "diagnose DNS and TCP connectivity to example.com",
+            "Use native Get-Net* cmdlets, Resolve-DnsName, and Test-NetConnection",
+        ),
+        (
+            "show failed services and their current state",
+            "Use Get-Service and Get-Process for service and process diagnostics",
+        ),
+        (
+            "check and repair the component store and protected system files",
+            "Use DISM.exe and sfc.exe for image and system-file repair",
+        ),
+    ];
+
+    for (query, _) in cases {
+        let response = daemon.query_with_context(query, false, context.clone());
+        assert_eq!(response["command"], "Get-Date");
+        assert_eq!(response["risk"]["level"], "safe");
+    }
+
+    let requests = daemon.generate_requests();
+    assert_eq!(requests.len(), cases.len());
+    for (request, (query, relevant_policy)) in requests.iter().zip(cases) {
+        assert_eq!(request["prompt"], query);
+        let system = request["system"].as_str().unwrap();
+        assert!(system.contains(relevant_policy), "missing policy: {system}");
+        assert!(system.contains("Target pwsh 7.4 or newer"));
+        assert!(system.contains("emit exactly one command, never alternatives"));
+        assert!(system.contains("Never self-elevate, invoke RunAs"));
+        assert!(system.contains("PowerShell: 7.4.6"));
+        assert!(system.contains("Elevated: no"));
+        assert!(
+            system.contains("Installed diagnostic tools: pwsh.exe, pnputil.exe, dism.exe, sfc.exe")
+        );
+        assert!(!system.contains("standard POSIX tools"));
+    }
 }
 
 #[test]
