@@ -1,0 +1,38 @@
+# cargo-deny configuration: advisories, license policy, duplicate bans,
+# and source restrictions for the dependency tree.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Yanked crates are a supply-chain smell; refuse them outright.
+yanked = "deny"
+
+[licenses]
+# Permissive licenses only. Anything outside this list fails CI and
+# needs an explicit, reviewed addition here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # MPL-2.0 is file-level copyleft; option-ext (via dirs) is consumed
+    # unmodified, which imposes no obligations on this binary.
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions bloat the binary; warn so PRs surface them.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
