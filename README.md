@@ -6,7 +6,7 @@ Natural language to shell commands. Instantly.
 
 ```
   $ ctrl+k
-  ┌──────────────── llmcmd ────────────────┐
+  ┌──────────────── incant ────────────────┐
   │ find rust files modified today          │
   └────────────────────────────────────────-┘
   $ fd -e rs --changed-within 1d
@@ -39,41 +39,41 @@ Requires Rust 1.70+ and one of:
 
 ```bash
 # Start the daemon
-llmcmd daemon start
+incant daemon start
 
 # Press Ctrl+K in your shell, or:
-llmcmd "list all docker containers that exited with an error"
+incant "list all docker containers that exited with an error"
 # docker ps -a --filter "status=exited" --filter "exited=1"
 
-llmcmd "compress this directory excluding node_modules"
+incant "compress this directory excluding node_modules"
 # tar --exclude='node_modules' -czf archive.tar.gz .
 
-llmcmd --pipe "disk usage sorted by size" | sh
+incant --pipe "disk usage sorted by size" | sh
 # Pipe mode: no TUI, direct output, scriptable
 ```
 
 ## Usage
 
 ```bash
-llmcmd                            # Interactive TUI popup
-llmcmd "query"                    # TUI with pre-filled query
-llmcmd --pipe "query"             # No TUI, direct stdout (for scripting)
-llmcmd --fast "query"             # Use fast profile (smaller/faster model)
-llmcmd --profile heavy "query"    # Use a named profile
-llmcmd --model gpt-4o "query"     # Override model directly
+incant                            # Interactive TUI popup
+incant "query"                    # TUI with pre-filled query
+incant --pipe "query"             # No TUI, direct stdout (for scripting)
+incant --fast "query"             # Use fast profile (smaller/faster model)
+incant --profile heavy "query"    # Use a named profile
+incant --model gpt-4o "query"     # Override model directly
 
-llmcmd daemon start|stop|status   # Daemon lifecycle
-llmcmd models list|pull|remove    # Ollama model management
-llmcmd config                     # Open config in $EDITOR
-llmcmd profiles                   # List available profiles
-llmcmd install                    # Show shell integration setup
+incant daemon start|stop|status   # Daemon lifecycle
+incant models list|pull|remove    # Ollama model management
+incant config                     # Open config in $EDITOR
+incant profiles                   # List available profiles
+incant install                    # Show shell integration setup
 ```
 
 ## Architecture
 
 ```
 ┌───────────────────────────────────────────────┐
-│  llmcmd daemon (long-running)                 │
+│  incant daemon (long-running)                 │
 │                                               │
 │  - Holds LLM connections + pre-cached prompt  │
 │  - Async Tokio runtime                        │
@@ -82,7 +82,7 @@ llmcmd install                    # Show shell integration setup
                     │ Unix domain socket
                     │ (length-prefixed JSON)
 ┌───────────────────┴───────────────────────────┐
-│  llmcmd client                                │
+│  incant client                                │
 │                                               │
 │  - Instant startup (<30ms)                    │
 │  - Minimal TUI renders to stderr              │
@@ -94,7 +94,7 @@ The daemon stays warm with LLM connections and a pre-cached system prompt. The c
 
 ## Configuration
 
-Config lives at `~/.config/llmcmd/config.toml`. Run `llmcmd config` to edit it.
+Config lives at `~/.config/incant/config.toml`. Run `incant config` to edit it.
 
 ### Ollama (default -- fully local, no API key)
 
@@ -158,36 +158,36 @@ The installer sets this up automatically. Press **Ctrl+K** anywhere in your term
 
 **Zsh** (`~/.zshrc`):
 ```zsh
-function _llmcmd_widget() {
+function _incant_widget() {
     local cmd
-    cmd=$(llmcmd </dev/tty)
+    cmd=$(incant </dev/tty)
     if [[ -n "$cmd" ]]; then
         LBUFFER+="$cmd"
     fi
     zle redisplay
 }
-zle -N _llmcmd_widget
-bindkey '^k' _llmcmd_widget
+zle -N _incant_widget
+bindkey '^k' _incant_widget
 ```
 
 **Bash** (`~/.bashrc`):
 ```bash
-_llmcmd_readline() {
+_incant_readline() {
     local cmd
-    cmd=$(llmcmd </dev/tty)
+    cmd=$(incant </dev/tty)
     READLINE_LINE="${READLINE_LINE}${cmd}"
     READLINE_POINT=${#READLINE_LINE}
 }
-bind -x '"\C-k": _llmcmd_readline'
+bind -x '"\C-k": _incant_readline'
 ```
 
 **Fish** (`~/.config/fish/config.fish`):
 ```fish
-function _llmcmd_fish
-    set -l cmd (llmcmd </dev/tty)
+function _incant_fish
+    set -l cmd (incant </dev/tty)
     commandline -i $cmd
 end
-bind \ck _llmcmd_fish
+bind \ck _incant_fish
 ```
 
 The `</dev/tty` redirect is required for the TUI to work inside shell widgets.
@@ -222,7 +222,7 @@ incant currently does one thing well: single-command translation. But the archit
 git clone https://github.com/deepc0py/incant.git
 cd incant
 cargo build --release
-# Binary: target/release/llmcmd
+# Binary: target/release/incant
 ```
 
 ```bash

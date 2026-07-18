@@ -1,4 +1,4 @@
-//! Daemon module for the llmcmd daemon.
+//! Daemon module for the incant daemon.
 //!
 //! The daemon is a long-running process that:
 //! - Holds the LLM connection (Ollama or API)

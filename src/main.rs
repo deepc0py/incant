@@ -1,4 +1,4 @@
-//! llmcmd - A hyper-performant terminal command translator.
+//! incant - A hyper-performant terminal command translator.
 //!
 //! Takes natural language input via a minimal TUI popup and outputs the exact
 //! shell command. Designed for sub-500ms latency with a daemon + client model.
@@ -17,7 +17,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "llmcmd")]
+#[command(name = "incant")]
 #[command(
     author,
     version,
@@ -53,7 +53,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Manage the llmcmd daemon
+    /// Manage the incant daemon
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
@@ -201,7 +201,7 @@ async fn start_daemon() -> Result<()> {
         }
     }
 
-    eprintln!("\nDaemon startup timed out. Run 'llmcmd daemon run' to see errors.");
+    eprintln!("\nDaemon startup timed out. Run 'incant daemon run' to see errors.");
     std::process::exit(1);
 }
 
@@ -233,7 +233,7 @@ async fn daemon_status() -> Result<()> {
         println!("Socket: {}", config::Config::socket_path()?.display());
     } else {
         println!("Daemon: not running");
-        println!("Start with: llmcmd daemon start");
+        println!("Start with: incant daemon start");
     }
     Ok(())
 }
@@ -244,12 +244,12 @@ async fn run_daemon_foreground() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("llmcmd=info".parse().unwrap())
+                .add_directive("incant=info".parse().unwrap())
                 .add_directive("reqwest=warn".parse().unwrap()),
         )
         .init();
 
-    info!("Starting llmcmd daemon...");
+    info!("Starting incant daemon...");
 
     let config = config::Config::load().context("Failed to load configuration")?;
     info!(
@@ -309,8 +309,8 @@ async fn list_models(host: &str) -> Result<()> {
     if let Some(models) = data.get("models").and_then(|m| m.as_array()) {
         if models.is_empty() {
             println!("No models installed.");
-            println!("\nPull a model with: llmcmd models pull <model>");
-            println!("Example: llmcmd models pull qwen2.5-coder:7b");
+            println!("\nPull a model with: incant models pull <model>");
+            println!("Example: incant models pull qwen2.5-coder:7b");
         } else {
             for model in models {
                 let name = model
@@ -502,36 +502,36 @@ fn handle_install() -> Result<()> {
     if shell.contains("zsh") {
         println!("Add to ~/.zshrc:\n");
         println!(
-            r#"function _llmcmd_widget() {{
+            r#"function _incant_widget() {{
     local cmd
-    cmd=$(llmcmd </dev/tty)
+    cmd=$(incant </dev/tty)
     if [[ -n "$cmd" ]]; then
         LBUFFER+="$cmd"
     fi
     zle redisplay
 }}
-zle -N _llmcmd_widget
-bindkey '^k' _llmcmd_widget"#
+zle -N _incant_widget
+bindkey '^k' _incant_widget"#
         );
     } else if shell.contains("bash") {
         println!("Add to ~/.bashrc:\n");
         println!(
-            r#"_llmcmd_readline() {{
+            r#"_incant_readline() {{
     local cmd
-    cmd=$(llmcmd </dev/tty)
+    cmd=$(incant </dev/tty)
     READLINE_LINE="${{READLINE_LINE}}${{cmd}}"
     READLINE_POINT=${{#READLINE_LINE}}
 }}
-bind -x '"\C-k": _llmcmd_readline'"#
+bind -x '"\C-k": _incant_readline'"#
         );
     } else if shell.contains("fish") {
         println!("Add to ~/.config/fish/config.fish:\n");
         println!(
-            r#"function _llmcmd_fish
-    set -l cmd (llmcmd </dev/tty)
+            r#"function _incant_fish
+    set -l cmd (incant </dev/tty)
     commandline -i $cmd
 end
-bind \ck _llmcmd_fish"#
+bind \ck _incant_fish"#
         );
     } else {
         println!("Unknown shell: {}", shell);
@@ -572,9 +572,9 @@ fn handle_profiles() -> Result<()> {
     }
 
     println!("Usage:");
-    println!("  llmcmd --fast \"query\"           # Use 'fast' profile");
-    println!("  llmcmd --profile heavy \"query\"  # Use 'heavy' profile");
-    println!("  llmcmd --model custom:7b \"query\" # Override model directly");
+    println!("  incant --fast \"query\"           # Use 'fast' profile");
+    println!("  incant --profile heavy \"query\"  # Use 'heavy' profile");
+    println!("  incant --model custom:7b \"query\" # Override model directly");
 
     Ok(())
 }
@@ -593,7 +593,7 @@ async fn handle_query(
     // Ensure daemon is running, try to auto-start if not
     if !daemon::server::is_daemon_running().await {
         if pipe_mode {
-            eprintln!("Daemon not running. Start with: llmcmd daemon start");
+            eprintln!("Daemon not running. Start with: incant daemon start");
             std::process::exit(1);
         }
 

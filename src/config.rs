@@ -1,6 +1,6 @@
-//! Configuration management for llmcmd.
+//! Configuration management for incant.
 //!
-//! Configuration is loaded from `~/.config/llmcmd/config.toml`.
+//! Configuration is loaded from `~/.config/incant/config.toml`.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -215,7 +215,7 @@ impl Config {
     /// Get the config directory path.
     pub fn config_dir() -> Result<PathBuf> {
         dirs::config_dir()
-            .map(|p| p.join("llmcmd"))
+            .map(|p| p.join("incant"))
             .context("Could not determine config directory")
     }
 
@@ -226,12 +226,12 @@ impl Config {
 
     /// Get the socket path for daemon communication.
     pub fn socket_path() -> Result<PathBuf> {
-        // Prefer XDG_RUNTIME_DIR, fall back to ~/.local/run/llmcmd
+        // Prefer XDG_RUNTIME_DIR, fall back to ~/.local/run/incant
         if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            Ok(PathBuf::from(runtime_dir).join("llmcmd.sock"))
+            Ok(PathBuf::from(runtime_dir).join("incant.sock"))
         } else {
             dirs::home_dir()
-                .map(|p| p.join(".local/run/llmcmd.sock"))
+                .map(|p| p.join(".local/run/incant.sock"))
                 .context("Could not determine home directory")
         }
     }
@@ -239,10 +239,10 @@ impl Config {
     /// Get the PID file path for the daemon.
     pub fn pid_path() -> Result<PathBuf> {
         if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            Ok(PathBuf::from(runtime_dir).join("llmcmd.pid"))
+            Ok(PathBuf::from(runtime_dir).join("incant.pid"))
         } else {
             dirs::home_dir()
-                .map(|p| p.join(".local/run/llmcmd.pid"))
+                .map(|p| p.join(".local/run/incant.pid"))
                 .context("Could not determine home directory")
         }
     }
@@ -250,10 +250,10 @@ impl Config {
     /// Get the startup status file path for daemon startup reporting.
     pub fn startup_status_path() -> Result<PathBuf> {
         if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            Ok(PathBuf::from(runtime_dir).join("llmcmd.startup"))
+            Ok(PathBuf::from(runtime_dir).join("incant.startup"))
         } else {
             dirs::home_dir()
-                .map(|p| p.join(".local/run/llmcmd.startup"))
+                .map(|p| p.join(".local/run/incant.startup"))
                 .context("Could not determine home directory")
         }
     }
