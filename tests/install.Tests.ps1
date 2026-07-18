@@ -8,7 +8,9 @@ BeforeAll {
 Describe 'install.ps1' {
     BeforeEach {
         $script:OriginalHome = $env:HOME
+        $script:OriginalProcessPath = $env:Path
         $env:HOME = Join-Path $TestDrive 'home'
+        Remove-Item -LiteralPath $env:HOME -Recurse -Force -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Path $env:HOME -Force | Out-Null
 
         $script:InstallDir = Join-Path $env:HOME 'bin'
@@ -16,6 +18,7 @@ Describe 'install.ps1' {
         $script:ProfilePath = Join-Path $env:HOME 'profile.ps1'
         $script:ExistingPath = Join-Path $env:HOME 'existing-bin'
         $script:FakeUserPath = $script:ExistingPath
+        $env:Path = $script:ExistingPath
 
         $fixtureRoot = Join-Path $TestDrive 'fixture'
         $fixturePackage = Join-Path $fixtureRoot 'incant-1.2.3-x86_64-pc-windows-msvc'
@@ -25,7 +28,7 @@ Describe 'install.ps1' {
 
         $script:AssetName = 'incant-1.2.3-x86_64-pc-windows-msvc.zip'
         $script:ArchivePath = Join-Path $TestDrive $script:AssetName
-        Compress-Archive -Path $fixturePackage -DestinationPath $script:ArchivePath
+        Compress-Archive -Path $fixturePackage -DestinationPath $script:ArchivePath -Force
         $hash = (Get-FileHash -LiteralPath $script:ArchivePath -Algorithm SHA256).Hash
         $script:ChecksumPath = Join-Path $TestDrive 'SHA256SUMS'
         Set-Content -LiteralPath $script:ChecksumPath -Value "$hash  $($script:AssetName)"
@@ -33,6 +36,11 @@ Describe 'install.ps1' {
         Mock Get-IncantWindowsTarget { 'x86_64-pc-windows-msvc' }
         Mock Get-IncantUserPath { $script:FakeUserPath }
         Mock Set-IncantUserPath { param($Value) $script:FakeUserPath = $Value }
+        Mock Invoke-IncantDaemonStop {
+            [pscustomobject]@{ ExitCode = 0; Output = 'Daemon is not running' }
+        }
+        Mock Wait-IncantBinaryUnlocked {}
+        Mock Write-Host {}
         Mock Invoke-IncantDownload {
             param($Uri, $Destination)
             if ([IO.Path]::GetFileName($Destination) -eq 'SHA256SUMS') {
@@ -46,6 +54,7 @@ Describe 'install.ps1' {
 
     AfterEach {
         $env:HOME = $script:OriginalHome
+        $env:Path = $script:OriginalProcessPath
     }
 
     It 'normalizes a leading v for the tag URL but not the archive basename' {
@@ -63,8 +72,8 @@ Describe 'install.ps1' {
     It 'selects the checksum for the exact zip basename' {
         $actualHash = (Get-FileHash -LiteralPath $script:ArchivePath -Algorithm SHA256).Hash
         Set-Content -LiteralPath $script:ChecksumPath -Value @(
-            \"$('0' * 64)  incant-1.2.3-aarch64-pc-windows-msvc.zip\"
-            \"$actualHash  $($script:AssetName)\"
+            "$('0' * 64)  incant-1.2.3-aarch64-pc-windows-msvc.zip"
+            "$actualHash  $($script:AssetName)"
         )
 
         {
@@ -73,11 +82,11 @@ Describe 'install.ps1' {
         } | Should -Not -Throw
 
         Set-Content -LiteralPath $script:ChecksumPath `
-            -Value \"$('0' * 64)  incant-1.2.3-aarch64-pc-windows-msvc.zip\"
+            -Value "$('0' * 64)  incant-1.2.3-aarch64-pc-windows-msvc.zip"
         {
             Assert-IncantArchiveChecksum -ArchivePath $script:ArchivePath `
                 -ChecksumPath $script:ChecksumPath -AssetName $script:AssetName
-        } | Should -Throw \"*checksum for $($script:AssetName) was not found*\"
+        } | Should -Throw "*checksum for $($script:AssetName) was not found*"
     }
 
     It 'is idempotent and preserves an existing config' {
@@ -91,6 +100,9 @@ Describe 'install.ps1' {
         (Get-Content -LiteralPath (Join-Path $script:ConfigDir 'config.toml') -Raw).Trim() |
             Should -Be 'user setting'
         $script:FakeUserPath.Split(';') |
+            Where-Object { (Get-NormalizedPathEntry $_) -ieq (Get-NormalizedPathEntry $script:InstallDir) } |
+            Should -HaveCount 1
+        $env:Path.Split([IO.Path]::PathSeparator) |
             Where-Object { (Get-NormalizedPathEntry $_) -ieq (Get-NormalizedPathEntry $script:InstallDir) } |
             Should -HaveCount 1
         $profile = Get-Content -LiteralPath $script:ProfilePath -Raw
@@ -120,9 +132,10 @@ Describe 'install.ps1' {
 
         $profile = Get-Content -LiteralPath $script:ProfilePath -Raw
         $profile | Should -Match "Set-PSReadLineKeyHandler -Chord 'Ctrl\+k'"
-        $profile | Should -Match [regex]::Escape('[Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()')
-        $profile | Should -Match [regex]::Escape('[Microsoft.PowerShell.PSConsoleReadLine]::Insert($result)')
+        $profile | Should -Match ([regex]::Escape('[Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()'))
+        $profile | Should -Match ([regex]::Escape('[Microsoft.PowerShell.PSConsoleReadLine]::Insert($result)'))
         $profile | Should -Not -Match 'AcceptLine'
+        $profile | Should -Not -Match '2>\$null'
         ([regex]::Matches($profile, [regex]::Escape($script:ProfileStartMarker))).Count | Should -Be 1
     }
 
@@ -131,13 +144,91 @@ Describe 'install.ps1' {
         $functionOnly = $block.Substring(0, $block.IndexOf("`n`nif (Get-Module", [StringComparison]::Ordinal))
         Invoke-Expression $functionOnly
         $script:BufferWasReplaced = $false
+        $script:Diagnostic = $null
 
         _IncantInvokePSReadLine `
             -ReadBuffer { [pscustomobject]@{ Line = 'original'; Cursor = 4 } } `
             -InvokeCommand { throw 'daemon unavailable' } `
-            -ReplaceBuffer { $script:BufferWasReplaced = $true } 2>$null
+            -ReplaceBuffer { $script:BufferWasReplaced = $true } `
+            -WriteDiagnostic { param($message) $script:Diagnostic = $message }
 
         $script:BufferWasReplaced | Should -BeFalse
+        $script:Diagnostic | Should -Be 'incant: daemon unavailable'
+    }
+
+    It 'returns silently without replacing the buffer when incant is cancelled' {
+        $block = Get-IncantProfileBlock
+        $functionOnly = $block.Substring(0, $block.IndexOf("`n`nif (Get-Module", [StringComparison]::Ordinal))
+        Invoke-Expression $functionOnly
+        $script:BufferWasReplaced = $false
+        $script:Diagnostic = $null
+
+        _IncantInvokePSReadLine `
+            -ReadBuffer { [pscustomobject]@{ Line = 'original'; Cursor = 4 } } `
+            -InvokeCommand { [pscustomobject]@{ ExitCode = 0; Output = @() } } `
+            -ReplaceBuffer { $script:BufferWasReplaced = $true } `
+            -WriteDiagnostic { param($message) $script:Diagnostic = $message }
+
+        $script:BufferWasReplaced | Should -BeFalse
+        $script:Diagnostic | Should -BeNullOrEmpty
+    }
+
+    It 'stops the existing daemon and waits for release before upgrading' {
+        Invoke-IncantInstaller -Version '1.2.3' -InstallDir $script:InstallDir `
+            -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath
+        Mock Invoke-IncantDaemonStop {
+            [pscustomobject]@{ ExitCode = 0; Output = 'Daemon stopped' }
+        }
+
+        Invoke-IncantInstaller -Version '1.2.3' -InstallDir $script:InstallDir `
+            -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath
+
+        Should -Invoke Invoke-IncantDaemonStop -Times 1 -Exactly -ParameterFilter {
+            $BinaryPath -eq (Join-Path $script:InstallDir 'incant.exe')
+        }
+        Should -Invoke Wait-IncantBinaryUnlocked -Times 1 -Exactly -ParameterFilter {
+            $BinaryPath -eq (Join-Path $script:InstallDir 'incant.exe')
+        }
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+            $Object -eq "Incant upgraded successfully: $(Join-Path $script:InstallDir 'incant.exe')"
+        }
+    }
+
+    It 'tolerates only documented daemon stop responses' {
+        $binary = Join-Path $script:InstallDir 'incant.exe'
+        {
+            Stop-IncantForUpgrade $binary
+        } | Should -Not -Throw
+
+        Mock Invoke-IncantDaemonStop {
+            [pscustomobject]@{ ExitCode = 0; Output = 'unknown state' }
+        }
+        {
+            Stop-IncantForUpgrade $binary
+        } | Should -Throw "*unexpected daemon stop response 'unknown state'*"
+    }
+
+    It 'fails with a precise diagnostic when the installed binary remains locked' {
+        $binary = Join-Path $script:InstallDir 'incant.exe'
+        Mock Wait-IncantBinaryUnlocked {
+            throw "Cannot upgrade Incant: '$BinaryPath' is still locked after stopping the daemon."
+        }
+
+        {
+            Stop-IncantForUpgrade $binary
+        } | Should -Throw "*is still locked after stopping the daemon*"
+    }
+
+    It 'reports installation and new-shell guidance' {
+        Invoke-IncantInstaller -Version '1.2.3' -InstallDir $script:InstallDir `
+            -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath
+
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+            $Object -eq "Incant installed successfully: $(Join-Path $script:InstallDir 'incant.exe')"
+        }
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+            $Object -eq 'Open a new PowerShell session to load the Ctrl+K integration and persistent PATH.'
+        }
     }
 
     It 'uninstalls owned state while preserving config and unrelated files' {

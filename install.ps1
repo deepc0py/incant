@@ -70,11 +70,17 @@ function Add-IncantUserPathEntry {
         (Get-IncantUserPath) -split ';' |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
-    if ($entries | Where-Object { (Get-NormalizedPathEntry $_) -ieq $normalized }) {
-        return
+    if (-not ($entries | Where-Object { (Get-NormalizedPathEntry $_) -ieq $normalized })) {
+        Set-IncantUserPath (($entries + $normalized) -join ';')
     }
 
-    Set-IncantUserPath (($entries + $normalized) -join ';')
+    $processEntries = @(
+        $env:Path -split [IO.Path]::PathSeparator |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if (-not ($processEntries | Where-Object { (Get-NormalizedPathEntry $_) -ieq $normalized })) {
+        $env:Path = ($processEntries + $normalized) -join [IO.Path]::PathSeparator
+    }
 }
 
 function Remove-IncantUserPathEntry {
@@ -92,6 +98,18 @@ function Remove-IncantUserPathEntry {
     if ($remainingEntries.Count -ne $entries.Count) {
         Set-IncantUserPath ($remainingEntries -join ';')
     }
+
+    $processEntries = @(
+        $env:Path -split [IO.Path]::PathSeparator |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $remainingProcessEntries = @(
+        $processEntries |
+            Where-Object { (Get-NormalizedPathEntry $_) -ine $normalized }
+    )
+    if ($remainingProcessEntries.Count -ne $processEntries.Count) {
+        $env:Path = $remainingProcessEntries -join [IO.Path]::PathSeparator
+    }
 }
 
 function Get-IncantProfileBlock {
@@ -108,13 +126,17 @@ function _IncantInvokePSReadLine {
         },
         [scriptblock] $InvokeCommand = {
             param([string] $line)
-            $stdout = @(& incant -- $line 2>$null)
+            $stdout = @(& incant -- $line)
             [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $stdout }
         },
         [scriptblock] $ReplaceBuffer = {
             param([string] $result)
             [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
             [Microsoft.PowerShell.PSConsoleReadLine]::Insert($result)
+        },
+        [scriptblock] $WriteDiagnostic = {
+            param([string] $message)
+            [Console]::Error.WriteLine($message)
         }
     )
 
@@ -126,11 +148,11 @@ function _IncantInvokePSReadLine {
         }
         $result = @($response.Output) -join [Environment]::NewLine
         if ([string]::IsNullOrWhiteSpace($result)) {
-            throw 'incant returned no command'
+            return
         }
     }
     catch {
-        [Console]::Error.WriteLine("incant: $($_.Exception.Message)")
+        & $WriteDiagnostic "incant: $($_.Exception.Message)"
         return
     }
 
@@ -241,7 +263,7 @@ function Assert-IncantArchiveChecksum {
         [Parameter(Mandatory)][string] $AssetName
     )
 
-    $pattern = '^(?<hash>[A-Fa-f0-9]{64})\s+\*?(?:\./)?{0}$' -f [regex]::Escape($AssetName)
+    $pattern = '^(?<hash>[A-Fa-f0-9]{64})\s+\*?(?:\./)?' + [regex]::Escape($AssetName) + '$'
     $checksumLine = Get-Content -LiteralPath $ChecksumPath |
         Where-Object { $_ -match $pattern } |
         Select-Object -First 1
@@ -256,6 +278,58 @@ function Assert-IncantArchiveChecksum {
     }
 }
 
+function Invoke-IncantDaemonStop {
+    param([Parameter(Mandatory)][string] $BinaryPath)
+
+    $output = @(& $BinaryPath daemon stop 2>&1)
+    [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output = (@($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine).Trim()
+    }
+}
+
+function Wait-IncantBinaryUnlocked {
+    param(
+        [Parameter(Mandatory)][string] $BinaryPath,
+        [int] $TimeoutMilliseconds = 5000
+    )
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        try {
+            $stream = [IO.File]::Open(
+                $BinaryPath,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None
+            )
+            $stream.Dispose()
+            return
+        }
+        catch [IO.IOException] {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "Cannot upgrade Incant: '$BinaryPath' is still locked after stopping the daemon."
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    } while ($true)
+}
+
+function Stop-IncantForUpgrade {
+    param([Parameter(Mandatory)][string] $BinaryPath)
+
+    $result = Invoke-IncantDaemonStop $BinaryPath
+    if ($result.ExitCode -ne 0) {
+        $detail = if ([string]::IsNullOrWhiteSpace($result.Output)) { '' } else { ": $($result.Output)" }
+        throw "Cannot upgrade Incant: 'incant.exe daemon stop' failed with status $($result.ExitCode)$detail"
+    }
+    if ($result.Output -notin @('Daemon stopped', 'Daemon is not running')) {
+        throw "Cannot upgrade Incant: unexpected daemon stop response '$($result.Output)'."
+    }
+
+    Wait-IncantBinaryUnlocked $BinaryPath
+}
+
 function Install-IncantFiles {
     param(
         [Parameter(Mandatory)][string] $BinaryPath,
@@ -265,8 +339,14 @@ function Install-IncantFiles {
         [Parameter(Mandatory)][string] $PowerShellProfile
     )
 
+    $installedBinary = Join-Path $Destination 'incant.exe'
+    $isUpgrade = Test-Path -LiteralPath $installedBinary
+    if ($isUpgrade) {
+        Stop-IncantForUpgrade $installedBinary
+    }
+
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
-    Copy-Item -LiteralPath $BinaryPath -Destination (Join-Path $Destination 'incant.exe') -Force
+    Copy-Item -LiteralPath $BinaryPath -Destination $installedBinary -Force
 
     $configPath = Join-Path $ConfigurationDirectory 'config.toml'
     if (-not (Test-Path -LiteralPath $configPath)) {
@@ -276,6 +356,10 @@ function Install-IncantFiles {
 
     Add-IncantUserPathEntry $Destination
     Set-IncantProfileBlock $PowerShellProfile
+
+    $operation = if ($isUpgrade) { 'upgraded' } else { 'installed' }
+    Write-Host "Incant $operation successfully: $installedBinary"
+    Write-Host 'Open a new PowerShell session to load the Ctrl+K integration and persistent PATH.'
 }
 
 function Install-IncantRelease {
@@ -321,7 +405,7 @@ function Install-IncantRelease {
 function Install-IncantFromSource {
     param(
         [Parameter(Mandatory)][string] $RepositoryPath,
-        [Parameter(Mandatory)][ValidateSet('Debug', 'Release')][string] $Profile,
+        [Parameter(Mandatory)][ValidateSet('Debug', 'Release')][string] $BuildProfile,
         [Parameter(Mandatory)][string] $Destination,
         [Parameter(Mandatory)][string] $ConfigurationDirectory,
         [Parameter(Mandatory)][string] $PowerShellProfile
@@ -334,7 +418,7 @@ function Install-IncantFromSource {
     }
 
     $cargoArguments = @('build', '--locked', '--manifest-path', $manifest)
-    if ($Profile -eq 'Release') {
+    if ($BuildProfile -eq 'Release') {
         $cargoArguments += '--release'
     }
     & cargo @cargoArguments
@@ -342,7 +426,7 @@ function Install-IncantFromSource {
         throw "cargo build failed with status $LASTEXITCODE."
     }
 
-    $profileDirectory = if ($Profile -eq 'Release') { 'release' } else { 'debug' }
+    $profileDirectory = if ($BuildProfile -eq 'Release') { 'release' } else { 'debug' }
     $binary = Join-Path $RepositoryPath "target/$profileDirectory/incant.exe"
     if (-not (Test-Path -LiteralPath $binary)) {
         throw "cargo did not produce $binary."
@@ -401,7 +485,7 @@ function Invoke-IncantInstaller {
 
     switch ($PSCmdlet.ParameterSetName) {
         'Source' {
-            Install-IncantFromSource -RepositoryPath $SourcePath -Profile $BuildProfile `
+            Install-IncantFromSource -RepositoryPath $SourcePath -BuildProfile $BuildProfile `
                 -Destination $InstallDir -ConfigurationDirectory $ConfigDir `
                 -PowerShellProfile $ProfilePath
         }
