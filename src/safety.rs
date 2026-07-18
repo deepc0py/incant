@@ -109,17 +109,19 @@ impl Rule {
         }
 
         any_powershell_segment(command, |segment| {
-            let Some(primary_match) = self.all.first().and_then(|re| re.find(segment)) else {
+            let Some(primary) = self.all.first() else {
                 return false;
             };
             if !self.all[1..].iter().all(|re| re.is_match(segment)) {
                 return false;
             }
 
-            let invocation = powershell_invocation_scope(segment, primary_match.start());
-            self.unless
-                .as_ref()
-                .is_none_or(|re| !re.is_match(&mask_powershell_non_code(invocation)))
+            primary.find_iter(segment).any(|primary_match| {
+                let invocation = powershell_invocation_scope(segment, primary_match.start());
+                self.unless
+                    .as_ref()
+                    .is_none_or(|re| !re.is_match(&mask_powershell_non_code(invocation)))
+            })
         })
     }
 }
@@ -1239,6 +1241,7 @@ mod tests {
             "Stop-Service Spooler # -WhatIf",
             "Write-Output -WhatIf $(Stop-Service Spooler)",
             "Write-Output $(Stop-Service Spooler) -WhatIf",
+            "Write-Output $(Stop-Service Spooler -WhatIf) + $(Stop-Service Spooler)",
             "Remove-Item -Path HKLM:\\Software\\Incant; Get-Item -WhatIf",
         ] {
             assert_flags(
@@ -1254,6 +1257,10 @@ mod tests {
 
         assert_not_rule(
             "Write-Output $(Stop-Service Spooler -WhatIf)",
+            "powershell-service-change",
+        );
+        assert_not_rule(
+            "Write-Output $(Stop-Service Spooler -WhatIf) + $(Stop-Service Spooler -WhatIf)",
             "powershell-service-change",
         );
         assert_flags(
