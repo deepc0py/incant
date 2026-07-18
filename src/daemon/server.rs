@@ -48,9 +48,9 @@ impl DaemonServer {
     async fn run_inner(&self) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = self.socket_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("Failed to create socket directory: {}", parent.display()))?;
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!("Failed to create socket directory: {}", parent.display())
+            })?;
         }
 
         // Remove existing socket file
@@ -188,11 +188,7 @@ async fn handle_client(
         }
         Message::Status => {
             // Return status information
-            Response::success(format!(
-                "Backend: {} ({})",
-                backend.name(),
-                backend.model()
-            ))
+            Response::success(format!("Backend: {} ({})", backend.name(), backend.model()))
         }
         Message::Shutdown => {
             info!("Received shutdown request");
