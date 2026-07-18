@@ -24,6 +24,10 @@ allow = [
     # MPL-2.0 is file-level copyleft; option-ext (via dirs) is consumed
     # unmodified, which imposes no obligations on this binary.
     "MPL-2.0",
+    # CDLA-Permissive-2.0 covers the Mozilla CA certificate data shipped
+    # by webpki-roots (via reqwest's rustls backend). Permissive data
+    # license; no obligations on this binary.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
