@@ -895,6 +895,13 @@ mod tests {
         // connect must reject its kernel owner before the server can observe
         // even a frame length byte.
         let user = CurrentUser::load().unwrap();
+        let wrong_owner_endpoint = Endpoint {
+            pipe_name: format!(
+                r"\\.\pipe\incant-{}-wrong-owner-{}",
+                user.sid_string,
+                std::process::id()
+            ),
+        };
         let primary_group = current_primary_group().unwrap();
         assert_eq!(
             unsafe { EqualSid(primary_group.as_psid(), user.sid.as_psid()) },
@@ -919,7 +926,7 @@ mod tests {
                 .reject_remote_clients(true)
                 .first_pipe_instance(true)
                 .create_with_security_attributes_raw(
-                    &endpoint.pipe_name,
+                    &wrong_owner_endpoint.pipe_name,
                     &mut attributes as *mut _ as *mut std::ffi::c_void,
                 )
         };
@@ -937,7 +944,7 @@ mod tests {
             .unwrap()
         });
         tokio::task::yield_now().await;
-        let mismatch = connect(&endpoint).await.unwrap_err();
+        let mismatch = connect(&wrong_owner_endpoint).await.unwrap_err();
         assert!(mismatch
             .to_string()
             .contains("Named-pipe server owner is not the current user"));
