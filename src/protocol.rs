@@ -43,14 +43,28 @@ pub struct Response {
     /// Error message, if the request failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Advisory safety assessment of the generated command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<crate::safety::Assessment>,
 }
 
 impl Response {
-    /// Create a successful response with a command.
-    pub fn success(command: String) -> Self {
+    /// Create a successful response with a command and its safety assessment.
+    pub fn success(command: String, risk: crate::safety::Assessment) -> Self {
         Self {
             command: Some(command),
             error: None,
+            risk: Some(risk),
+        }
+    }
+
+    /// Create a response carrying informational text (e.g. daemon status)
+    /// that is not a generated command, so no risk assessment applies.
+    pub fn plain(text: String) -> Self {
+        Self {
+            command: Some(text),
+            error: None,
+            risk: None,
         }
     }
 
@@ -59,6 +73,7 @@ impl Response {
         Self {
             command: None,
             error: Some(message.into()),
+            risk: None,
         }
     }
 }
@@ -123,9 +138,26 @@ mod tests {
 
     #[test]
     fn test_response_success() {
-        let resp = Response::success("ls -la".to_string());
+        let resp = Response::success("ls -la".to_string(), crate::safety::assess("ls -la"));
         assert_eq!(resp.command, Some("ls -la".to_string()));
         assert!(resp.error.is_none());
+        assert!(resp.risk.as_ref().is_some_and(|r| r.is_safe()));
+    }
+
+    #[test]
+    fn test_response_plain_has_no_risk() {
+        let resp = Response::plain("Backend: ollama (qwen)".to_string());
+        assert!(resp.command.is_some());
+        assert!(resp.risk.is_none());
+    }
+
+    #[test]
+    fn test_response_risk_roundtrips_through_json() {
+        let resp = Response::success("rm -rf /".to_string(), crate::safety::assess("rm -rf /"));
+        let json = serde_json::to_vec(&resp).unwrap();
+        let back: Response = serde_json::from_slice(&json).unwrap();
+        let risk = back.risk.expect("risk must survive serialization");
+        assert_eq!(risk.level, crate::safety::RiskLevel::Destructive);
     }
 
     #[test]

@@ -51,3 +51,7 @@ temperature = 0.0
 modern_tools = true
 # Prefer verbose flags (--recursive over -r)
 verbose_flags = true
+# Warn on stderr when a generated command looks destructive
+# (rm -rf on broad paths, dd to devices, force-pushes, ...).
+# Advisory only: incant never executes or blocks commands.
+safety_warnings = true

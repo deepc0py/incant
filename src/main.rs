@@ -8,6 +8,7 @@ mod config;
 mod context;
 mod daemon;
 mod protocol;
+mod safety;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -636,17 +637,49 @@ async fn handle_query(
     )
     .await
     {
-        Ok(command) => {
+        Ok(generated) => {
+            // Advisory safety warnings go to stderr so stdout stays a
+            // clean command for shell-buffer injection.
+            if config.preferences.safety_warnings {
+                if let Some(risk) = &generated.risk {
+                    print_risk_warnings(risk);
+                }
+            }
             // Output just the command to stdout
-            println!("{}", command);
+            println!("{}", generated.command);
         }
         Err(e) => {
-            if !pipe_mode {
-                eprintln!("Error: {}", e);
-            }
+            eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     }
 
     Ok(())
+}
+
+/// Print advisory safety findings to stderr, colored when stderr is a
+/// terminal and NO_COLOR is unset.
+fn print_risk_warnings(risk: &safety::Assessment) {
+    use std::io::IsTerminal;
+
+    if risk.is_safe() {
+        return;
+    }
+
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    for finding in &risk.findings {
+        let (symbol, code) = match finding.level {
+            safety::RiskLevel::Destructive => ("!!", "\x1b[1;31m"),
+            safety::RiskLevel::Caution => ("!", "\x1b[1;33m"),
+            safety::RiskLevel::Safe => continue,
+        };
+        if color {
+            eprintln!(
+                "{}{} {}: {}\x1b[0m",
+                code, symbol, finding.level, finding.reason
+            );
+        } else {
+            eprintln!("{} {}: {}", symbol, finding.level, finding.reason);
+        }
+    }
 }
