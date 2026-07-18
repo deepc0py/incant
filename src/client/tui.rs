@@ -108,16 +108,21 @@ fn run_input_loop<W: Write>(
                 }
             }
             // Regular printable ASCII
-            c if c >= 0x20 && c < 0x7f => {
+            c if (0x20..0x7f).contains(&c) => {
                 input_text.push(c as char);
             }
             // UTF-8 multi-byte sequences
             c if c >= 0x80 => {
                 // Determine how many bytes in this UTF-8 character
-                let width = if c & 0xE0 == 0xC0 { 2 }
-                    else if c & 0xF0 == 0xE0 { 3 }
-                    else if c & 0xF8 == 0xF0 { 4 }
-                    else { 1 };
+                let width = if c & 0xE0 == 0xC0 {
+                    2
+                } else if c & 0xF0 == 0xE0 {
+                    3
+                } else if c & 0xF8 == 0xF0 {
+                    4
+                } else {
+                    1
+                };
 
                 let mut utf8_buf = vec![c];
                 for _ in 1..width {
@@ -150,7 +155,11 @@ fn draw_ui(frame: &mut Frame, input_text: &str) {
     // Create the input block
     let block = Block::default()
         .title(" llmcmd ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -172,9 +181,10 @@ fn draw_ui(frame: &mut Frame, input_text: &str) {
     let visible_value: String = input_text.chars().skip(scroll).take(input_width).collect();
 
     // Create the input paragraph
-    let input_paragraph = Paragraph::new(Line::from(vec![
-        Span::styled(visible_value, Style::default().fg(Color::White)),
-    ]));
+    let input_paragraph = Paragraph::new(Line::from(vec![Span::styled(
+        visible_value,
+        Style::default().fg(Color::White),
+    )]));
 
     frame.render_widget(input_paragraph, inner_area);
 

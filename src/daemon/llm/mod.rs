@@ -29,16 +29,31 @@ impl Backend {
     ) -> Result<String> {
         match self {
             Backend::Ollama(b) => {
-                b.generate(system_prompt, user_query, model_override, temperature_override)
-                    .await
+                b.generate(
+                    system_prompt,
+                    user_query,
+                    model_override,
+                    temperature_override,
+                )
+                .await
             }
             Backend::Anthropic(b) => {
-                b.generate(system_prompt, user_query, model_override, temperature_override)
-                    .await
+                b.generate(
+                    system_prompt,
+                    user_query,
+                    model_override,
+                    temperature_override,
+                )
+                .await
             }
             Backend::OpenAI(b) => {
-                b.generate(system_prompt, user_query, model_override, temperature_override)
-                    .await
+                b.generate(
+                    system_prompt,
+                    user_query,
+                    model_override,
+                    temperature_override,
+                )
+                .await
             }
         }
     }

@@ -63,20 +63,6 @@ impl Response {
     }
 }
 
-/// Status information for the daemon.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DaemonStatus {
-    /// Whether the daemon is running.
-    pub running: bool,
-    /// The backend type being used.
-    pub backend: String,
-    /// The model being used.
-    pub model: String,
-    /// Process ID of the daemon.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u32>,
-}
-
 /// Message type for IPC communication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

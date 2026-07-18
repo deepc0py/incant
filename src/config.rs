@@ -275,8 +275,9 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
         }
         let contents = toml::to_string_pretty(self)?;
         std::fs::write(&path, contents)
@@ -296,9 +297,15 @@ impl Config {
     /// Get the default profile name from backend config.
     pub fn default_profile(&self) -> &str {
         match &self.backend {
-            BackendConfig::Ollama { default_profile, .. } => default_profile,
-            BackendConfig::Anthropic { default_profile, .. } => default_profile,
-            BackendConfig::OpenAI { default_profile, .. } => default_profile,
+            BackendConfig::Ollama {
+                default_profile, ..
+            } => default_profile,
+            BackendConfig::Anthropic {
+                default_profile, ..
+            } => default_profile,
+            BackendConfig::OpenAI {
+                default_profile, ..
+            } => default_profile,
         }
     }
 
@@ -319,28 +326,6 @@ impl Config {
         } else {
             self.fallback_model().to_string()
         }
-    }
-
-    /// Get the Ollama host URL.
-    pub fn ollama_host(&self) -> Option<&str> {
-        match &self.backend {
-            BackendConfig::Ollama { host, .. } => Some(host),
-            _ => None,
-        }
-    }
-
-    /// Get the API key for cloud backends.
-    pub fn api_key(&self) -> Option<&str> {
-        match &self.backend {
-            BackendConfig::Anthropic { api_key, .. } => api_key.as_deref(),
-            BackendConfig::OpenAI { api_key, .. } => api_key.as_deref(),
-            _ => None,
-        }
-    }
-
-    /// Get all profile names.
-    pub fn profile_names(&self) -> Vec<&String> {
-        self.profiles.keys().collect()
     }
 
     /// Build the system prompt based on context and preferences.

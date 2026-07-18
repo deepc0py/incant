@@ -16,18 +16,15 @@ pub async fn send_query(
     let socket_path = Config::socket_path()?;
 
     // Connect with timeout
-    let stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        UnixStream::connect(&socket_path),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Connection timeout - is the daemon running?"))?
-    .with_context(|| {
-        format!(
-            "Failed to connect to daemon at {}. Start it with: llmcmd daemon start",
-            socket_path.display()
-        )
-    })?;
+    let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket_path))
+        .await
+        .map_err(|_| anyhow::anyhow!("Connection timeout - is the daemon running?"))?
+        .with_context(|| {
+            format!(
+                "Failed to connect to daemon at {}. Start it with: llmcmd daemon start",
+                socket_path.display()
+            )
+        })?;
 
     send_query_to_stream(stream, query, context, model, temperature).await
 }
@@ -81,22 +78,18 @@ pub async fn check_daemon() -> Result<()> {
         ));
     }
 
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        UnixStream::connect(&socket_path),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+    let mut stream =
+        tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(&socket_path))
+            .await
+            .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
 
     // Send status request
     framing::write_message(&mut stream, &Message::Status).await?;
 
-    let response: Response = tokio::time::timeout(
-        Duration::from_secs(2),
-        framing::read_message(&mut stream),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Status check timeout"))??;
+    let response: Response =
+        tokio::time::timeout(Duration::from_secs(2), framing::read_message(&mut stream))
+            .await
+            .map_err(|_| anyhow::anyhow!("Status check timeout"))??;
 
     if response.error.is_some() {
         return Err(anyhow::anyhow!(

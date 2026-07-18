@@ -18,8 +18,14 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "llmcmd")]
-#[command(author, version, about = "A hyper-performant terminal command translator")]
-#[command(long_about = "Takes natural language input and outputs shell commands.\n\nPress Ctrl+K in your shell to invoke (after shell integration is set up).")]
+#[command(
+    author,
+    version,
+    about = "A hyper-performant terminal command translator"
+)]
+#[command(
+    long_about = "Takes natural language input and outputs shell commands.\n\nPress Ctrl+K in your shell to invoke (after shell integration is set up)."
+)]
 struct Cli {
     /// Direct query mode - provide the query as an argument
     #[arg(value_name = "QUERY")]
@@ -224,10 +230,7 @@ async fn daemon_status() -> Result<()> {
         println!("Backend: {}", config.backend_type());
         println!("Default model: {}", config.model_name());
         println!("Default profile: {}", config.default_profile());
-        println!(
-            "Socket: {}",
-            config::Config::socket_path()?.display()
-        );
+        println!("Socket: {}", config::Config::socket_path()?.display());
     } else {
         println!("Daemon: not running");
         println!("Start with: llmcmd daemon start");
@@ -310,11 +313,14 @@ async fn list_models(host: &str) -> Result<()> {
             println!("Example: llmcmd models pull qwen2.5-coder:7b");
         } else {
             for model in models {
-                let name = model.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                let name = model
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
                 let size = model
                     .get("size")
                     .and_then(|s| s.as_u64())
-                    .map(|s| format_size(s))
+                    .map(format_size)
                     .unwrap_or_else(|| "?".to_string());
                 let modified = model
                     .get("modified_at")
@@ -365,7 +371,11 @@ async fn pull_model(host: &str, model: &str) -> Result<()> {
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Failed to pull model: {} - {}", status, body));
+        return Err(anyhow::anyhow!(
+            "Failed to pull model: {} - {}",
+            status,
+            body
+        ));
     }
 
     // Stream the response to show progress
@@ -387,7 +397,13 @@ async fn pull_model(host: &str, model: &str) -> Result<()> {
                         if let Some(completed) = json.get("completed").and_then(|c| c.as_u64()) {
                             if let Some(total) = json.get("total").and_then(|t| t.as_u64()) {
                                 let pct = (completed as f64 / total as f64 * 100.0) as u32;
-                                print!("\r{}: {}% ({}/{})", status, pct, format_size(completed), format_size(total));
+                                print!(
+                                    "\r{}: {}% ({}/{})",
+                                    status,
+                                    pct,
+                                    format_size(completed),
+                                    format_size(total)
+                                );
                                 std::io::Write::flush(&mut std::io::stdout())?;
                             }
                         } else {
@@ -399,7 +415,13 @@ async fn pull_model(host: &str, model: &str) -> Result<()> {
                         if let Some(completed) = json.get("completed").and_then(|c| c.as_u64()) {
                             if let Some(total) = json.get("total").and_then(|t| t.as_u64()) {
                                 let pct = (completed as f64 / total as f64 * 100.0) as u32;
-                                print!("\r{}: {}% ({}/{})", status, pct, format_size(completed), format_size(total));
+                                print!(
+                                    "\r{}: {}% ({}/{})",
+                                    status,
+                                    pct,
+                                    format_size(completed),
+                                    format_size(total)
+                                );
                                 std::io::Write::flush(&mut std::io::stdout())?;
                             }
                         }
@@ -479,7 +501,8 @@ fn handle_install() -> Result<()> {
 
     if shell.contains("zsh") {
         println!("Add to ~/.zshrc:\n");
-        println!(r#"function _llmcmd_widget() {{
+        println!(
+            r#"function _llmcmd_widget() {{
     local cmd
     cmd=$(llmcmd </dev/tty)
     if [[ -n "$cmd" ]]; then
@@ -488,23 +511,28 @@ fn handle_install() -> Result<()> {
     zle redisplay
 }}
 zle -N _llmcmd_widget
-bindkey '^k' _llmcmd_widget"#);
+bindkey '^k' _llmcmd_widget"#
+        );
     } else if shell.contains("bash") {
         println!("Add to ~/.bashrc:\n");
-        println!(r#"_llmcmd_readline() {{
+        println!(
+            r#"_llmcmd_readline() {{
     local cmd
     cmd=$(llmcmd </dev/tty)
     READLINE_LINE="${{READLINE_LINE}}${{cmd}}"
     READLINE_POINT=${{#READLINE_LINE}}
 }}
-bind -x '"\C-k": _llmcmd_readline'"#);
+bind -x '"\C-k": _llmcmd_readline'"#
+        );
     } else if shell.contains("fish") {
         println!("Add to ~/.config/fish/config.fish:\n");
-        println!(r#"function _llmcmd_fish
+        println!(
+            r#"function _llmcmd_fish
     set -l cmd (llmcmd </dev/tty)
     commandline -i $cmd
 end
-bind \ck _llmcmd_fish"#);
+bind \ck _llmcmd_fish"#
+        );
     } else {
         println!("Unknown shell: {}", shell);
         println!("\nManual setup required. See documentation for shell integration examples.");
@@ -600,8 +628,13 @@ async fn handle_query(
     let ctx = context::gather_context()?;
 
     // Send query to daemon with model override
-    match client::send_query(final_query, ctx, Some(resolved_model), Some(resolved_temperature))
-        .await
+    match client::send_query(
+        final_query,
+        ctx,
+        Some(resolved_model),
+        Some(resolved_temperature),
+    )
+    .await
     {
         Ok(command) => {
             // Output just the command to stdout
