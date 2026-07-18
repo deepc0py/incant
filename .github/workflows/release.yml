@@ -86,7 +86,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          # -creplace: strip only a lowercase 'v', matching bash's ${GITHUB_REF_NAME#v}.
+          $version = $env:GITHUB_REF_NAME -creplace '^v', ''
           $name = "incant-$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/incant.exe" -Destination $name
@@ -120,10 +121,15 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Collect checksums
+      - name: Collect and verify checksums
         run: |
           cd dist
           cat ./*.sha256 > SHA256SUMS
+          # Re-verify every downloaded archive against its build-time
+          # checksum; catches corruption or tampering in artifact
+          # transit and proves the Windows-emitted lines are
+          # shasum-parseable before anything is published.
+          shasum -a 256 --check --strict SHA256SUMS
           rm ./*.sha256
           cat SHA256SUMS
 
