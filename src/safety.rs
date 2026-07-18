@@ -116,6 +116,11 @@ const RM_BROAD_TARGET: &str = r#"\brm\s[^|;&]*\s(/\*?|~/?|"?\$HOME"?/?|\*|\.\.|\
 const CHMOD_RECURSIVE_WORLD: &str = r"\bchmod\s[^|;&]*-[a-zA-Z]*R[^|;&]*\b(777|a\+rwx)\b";
 const CHMOD_BROAD_TARGET: &str = r#"\bchmod\s[^|;&]*\s(/|~/?|"?\$HOME"?/?)\s*($|;|&|\|)"#;
 
+// PowerShell common parameters are case-insensitive. `-WhatIf` suppresses only
+// cmdlet rules that honor it; appending it to a native executable is not a
+// safety mechanism.
+const POWERSHELL_WHAT_IF: &str = r"(?i)(?:^|\s)-whatif(?:\s|$|:\s*\$true\b)";
+
 static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     vec![
         // ── Destructive ────────────────────────────────────────────────
@@ -194,6 +199,126 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             RiskLevel::Destructive,
             "recursively makes the filesystem root or home directory world-writable",
             &[CHMOD_RECURSIVE_WORLD, CHMOD_BROAD_TARGET],
+            None,
+        ),
+        // ── PowerShell destructive actions ─────────────────────────────
+        Rule::new(
+            "powershell-registry-change",
+            RiskLevel::Destructive,
+            "changes or removes Windows registry keys or values",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:remove-item|ri|del|erase|rmdir|remove-itemproperty|rp|clear-item|cli|clear-itemproperty|clp|set-item|si|set-itemproperty|sp|new-item|ni|new-itemproperty|rename-item|rni|move-item|mi|copy-item|cpi)\b['"]?[^|;\r\n]*(?:registry::|hk(?:lm|cu|cr|u|cc):)"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "windows-registry-native-change",
+            RiskLevel::Destructive,
+            "changes or removes Windows registry keys or values",
+            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*)?reg(?:\.exe)?\s+(?:add|delete|import|restore|load|unload)\b"],
+            None,
+        ),
+        Rule::new(
+            "powershell-service-change",
+            RiskLevel::Destructive,
+            "changes, stops, restarts, or removes a Windows service",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:stop-service|spsv|restart-service|remove-service|set-service)\b['"]?"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "windows-service-native-change",
+            RiskLevel::Destructive,
+            "changes, stops, or removes a Windows service",
+            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*)?sc\.exe\s+(?:stop|delete|config|failure|failureflag)\b"],
+            None,
+        ),
+        Rule::new(
+            "powershell-device-driver-change",
+            RiskLevel::Destructive,
+            "changes a Windows device or installed driver",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:disable-pnpdevice|enable-pnpdevice|remove-pnpdevice)\b['"]?"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "windows-pnputil-change",
+            RiskLevel::Destructive,
+            "adds, deletes, disables, removes, or restarts a Windows driver or device",
+            &[r"(?i)\bpnputil(?:\.exe)?\b[^|;\r\n]*/(?:add-driver|delete-driver|disable-device|enable-device|remove-device|restart-device)\b"],
+            None,
+        ),
+        Rule::new(
+            "powershell-storage-change",
+            RiskLevel::Destructive,
+            "initializes, formats, clears, resizes, or repartitions storage",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:clear-disk|initialize-disk|format-volume|remove-partition|resize-partition|set-disk)\b['"]?"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "powershell-firewall-change",
+            RiskLevel::Destructive,
+            "changes or removes Windows Firewall policy",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:(?:new|set|remove|disable)-netfirewall(?:rule|profile))\b['"]?"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "windows-firewall-native-change",
+            RiskLevel::Destructive,
+            "changes or resets Windows Firewall policy",
+            &[r"(?i)\bnetsh(?:\.exe)?\s+advfirewall\b[^|;\r\n]*\b(?:reset|set|add|delete)\b"],
+            None,
+        ),
+        Rule::new(
+            "powershell-network-change",
+            RiskLevel::Destructive,
+            "changes Windows network adapters, addresses, routes, or DNS configuration",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:disable-netadapter|restart-netadapter|new-netipaddress|remove-netipaddress|set-netipinterface|set-dnsclientserveraddress|new-netroute|remove-netroute|set-netroute)\b['"]?"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "windows-netsh-network-change",
+            RiskLevel::Destructive,
+            "changes Windows network interface configuration",
+            &[r"(?i)\bnetsh(?:\.exe)?\s+interface\b[^|;\r\n]*\b(?:set|add|delete)\b"],
+            None,
+        ),
+        Rule::new(
+            "powershell-event-log-clear",
+            RiskLevel::Destructive,
+            "clears a Windows event log",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?clear-eventlog\b['"]?"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "windows-event-log-native-clear",
+            RiskLevel::Destructive,
+            "clears a Windows event log",
+            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*)?wevtutil(?:\.exe)?\s+(?:cl|clear-log)\b"],
+            None,
+        ),
+        Rule::new(
+            "windows-bcd-change",
+            RiskLevel::Destructive,
+            "changes the Windows boot configuration database",
+            &[r"(?i)\bbcdedit(?:\.exe)?\b[^|;\r\n]*/(?:set|delete|deletevalue|create|createstore|import|copy|bootsequence|default|displayorder|timeout|toolsdisplayorder)\b"],
+            None,
+        ),
+        Rule::new(
+            "powershell-defender-change",
+            RiskLevel::Destructive,
+            "changes Microsoft Defender configuration",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:set-mppreference|add-mppreference|remove-mppreference)\b['"]?"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "powershell-execution-policy-change",
+            RiskLevel::Destructive,
+            "changes or bypasses PowerShell execution policy",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?set-executionpolicy\b['"]?"#],
+            Some(POWERSHELL_WHAT_IF),
+        ),
+        Rule::new(
+            "powershell-execution-policy-bypass",
+            RiskLevel::Destructive,
+            "starts PowerShell with a bypassed or unrestricted execution policy",
+            &[r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b[^|;\r\n]*(?:-executionpolicy|-ep)\s+(?:bypass|unrestricted)\b"],
             None,
         ),
         // ── Caution ────────────────────────────────────────────────────
@@ -279,6 +404,41 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             RiskLevel::Caution,
             "shuts down or reboots the machine",
             &[r"(^|\s|;|&&\s*)(sudo\s+)?(shutdown|reboot|halt|poweroff)(\s|$|;|&)"],
+            None,
+        ),
+        Rule::new(
+            "powershell-force",
+            RiskLevel::Caution,
+            "uses PowerShell -Force to suppress a command's normal guardrails",
+            &[r"(?i)(?:^|\s)-force(?:\s|$|[:=])"],
+            None,
+        ),
+        Rule::new(
+            "powershell-confirm-false",
+            RiskLevel::Caution,
+            "explicitly disables PowerShell confirmation prompts",
+            &[r"(?i)(?:^|\s)-confirm\s*:\s*\$false\b"],
+            None,
+        ),
+        Rule::new(
+            "powershell-invoke-expression",
+            RiskLevel::Caution,
+            "dynamically evaluates a string as PowerShell code",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:invoke-expression|iex)\b['"]?"#],
+            None,
+        ),
+        Rule::new(
+            "powershell-encoded-command",
+            RiskLevel::Caution,
+            "runs an encoded PowerShell command that is difficult to review",
+            &[r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b[^|;\r\n]*-(?:encodedcommand|enc)\s+\S+"],
+            None,
+        ),
+        Rule::new(
+            "powershell-runas",
+            RiskLevel::Caution,
+            "requests an elevated process through Start-Process -Verb RunAs",
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?start-process\b['"]?[^|;\r\n]*-verb\s+['"]?runas\b"#],
             None,
         ),
     ]
@@ -646,5 +806,204 @@ mod tests {
         let back: Assessment = serde_json::from_str(&json).unwrap();
         assert_eq!(back.level, RiskLevel::Destructive);
         assert_eq!(back.findings.len(), a.findings.len());
+    }
+
+    #[test]
+    fn powershell_destructive_rules_are_table_driven() {
+        let cases = [
+            (
+                "(RI 'HKLM:\\Software\\Incant' -Recurse)",
+                "powershell-registry-change",
+            ),
+            (
+                r#"reg.exe DELETE "HKCU\Software\Incant" /f"#,
+                "windows-registry-native-change",
+            ),
+            ("$(& 'sPsV' -Name Spooler)", "powershell-service-change"),
+            (
+                "sc.exe config Spooler start= disabled",
+                "windows-service-native-change",
+            ),
+            (
+                "DISABLE-PNPDEVICE -InstanceId $device.InstanceId",
+                "powershell-device-driver-change",
+            ),
+            (
+                "pnputil.exe /delete-driver oem42.inf /uninstall",
+                "windows-pnputil-change",
+            ),
+            (
+                "Get-Disk -Number 2 | Clear-Disk -RemoveData",
+                "powershell-storage-change",
+            ),
+            (
+                "Remove-NetFirewallRule -DisplayName 'Incant'",
+                "powershell-firewall-change",
+            ),
+            (
+                "netsh.exe advfirewall reset",
+                "windows-firewall-native-change",
+            ),
+            (
+                "Set-DnsClientServerAddress -InterfaceIndex 4 -ServerAddresses 1.1.1.1",
+                "powershell-network-change",
+            ),
+            (
+                "netsh interface ipv4 set address name=Ethernet source=dhcp",
+                "windows-netsh-network-change",
+            ),
+            (
+                "& 'Clear-EventLog' -LogName System",
+                "powershell-event-log-clear",
+            ),
+            (
+                "wevtutil.EXE cl Microsoft-Windows-Diagnostics-Performance/Operational",
+                "windows-event-log-native-clear",
+            ),
+            (
+                "bcdedit.exe /deletevalue {current} safeboot",
+                "windows-bcd-change",
+            ),
+            (
+                "Set-MpPreference -DisableRealtimeMonitoring $true",
+                "powershell-defender-change",
+            ),
+            (
+                "Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned",
+                "powershell-execution-policy-change",
+            ),
+            (
+                "pwsh.exe -ExecutionPolicy BYPASS -File repair.ps1",
+                "powershell-execution-policy-bypass",
+            ),
+        ];
+
+        for (command, rule) in cases {
+            assert_flags(command, rule, RiskLevel::Destructive);
+        }
+    }
+
+    #[test]
+    fn powershell_whatif_suppresses_supported_destructive_cmdlets() {
+        let cases = [
+            (
+                "Remove-Item -Path 'HKLM:\\Software\\Incant' -WhatIf",
+                "powershell-registry-change",
+            ),
+            (
+                "Stop-Service -Name Spooler -WhatIf",
+                "powershell-service-change",
+            ),
+            (
+                "Disable-PnpDevice -InstanceId abc -WhatIf:$true",
+                "powershell-device-driver-change",
+            ),
+            (
+                "Format-Volume -DriveLetter X -WhatIf",
+                "powershell-storage-change",
+            ),
+            (
+                "Remove-NetFirewallRule -Name Incant -WhatIf",
+                "powershell-firewall-change",
+            ),
+            (
+                "Remove-NetIPAddress -IPAddress 192.0.2.1 -WhatIf",
+                "powershell-network-change",
+            ),
+            (
+                "Clear-EventLog -LogName System -WhatIf",
+                "powershell-event-log-clear",
+            ),
+            (
+                "Set-MpPreference -DisableRealtimeMonitoring $true -WhatIf",
+                "powershell-defender-change",
+            ),
+            (
+                "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -WhatIf",
+                "powershell-execution-policy-change",
+            ),
+        ];
+
+        for (command, rule) in cases {
+            assert_not_rule(command, rule);
+            assert_ne!(
+                assess(command).level,
+                RiskLevel::Destructive,
+                "{command:?} must not be destructive with -WhatIf"
+            );
+        }
+        assert_flags(
+            "Stop-Service -Name Spooler -WhatIf:$false",
+            "powershell-service-change",
+            RiskLevel::Destructive,
+        );
+        assert_flags(
+            "pnputil.exe /delete-driver oem42.inf -WhatIf",
+            "windows-pnputil-change",
+            RiskLevel::Destructive,
+        );
+    }
+
+    #[test]
+    fn powershell_escalation_signals_are_table_driven() {
+        let cases = [
+            ("Remove-Item file.txt -FoRcE", "powershell-force"),
+            (
+                "Stop-Service Spooler -Confirm : $FALSE",
+                "powershell-confirm-false",
+            ),
+            (
+                "$result | InVoKe-ExPrEsSiOn",
+                "powershell-invoke-expression",
+            ),
+            ("$(iex $payload)", "powershell-invoke-expression"),
+            (
+                "powershell.exe -EncodedCommand SQBFAFgA",
+                "powershell-encoded-command",
+            ),
+            ("pwsh -enc SQBFAFgA", "powershell-encoded-command"),
+            (
+                "$(& 'Start-Process' pwsh -Verb 'RunAs')",
+                "powershell-runas",
+            ),
+        ];
+
+        for (command, rule) in cases {
+            assert_flags(command, rule, RiskLevel::Caution);
+        }
+    }
+
+    #[test]
+    fn powershell_read_only_and_textual_near_misses_are_not_destructive() {
+        let cases = [
+            "Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 41 }",
+            "Get-CimInstance -ClassName Win32_OperatingSystem",
+            "Get-PnpDevice -PresentOnly",
+            "pnputil.exe /enum-drivers",
+            "Get-Service -Name Spooler",
+            "Get-Process -Name explorer",
+            "Get-NetAdapter",
+            "Resolve-DnsName example.com",
+            "Test-NetConnection example.com -Port 443",
+            "Get-ItemProperty -Path 'HKLM:\\Software\\Microsoft'",
+            "reg.exe query HKLM\\Software\\Microsoft",
+            "sc.exe query Spooler",
+            "wevtutil.exe qe System /count:5",
+            "bcdedit.exe /enum",
+            "bcdedit.exe /export C:\\backup\\bcd",
+            "Get-MpPreference",
+            "Get-ExecutionPolicy -List",
+            "Write-Output 'Stop-Service is destructive'",
+            "Write-Output 'Set-MpPreference -DisableRealtimeMonitoring'",
+            "Get-ChildItem -Force",
+        ];
+
+        for command in cases {
+            assert_ne!(
+                assess(command).level,
+                RiskLevel::Destructive,
+                "{command:?} must remain non-destructive"
+            );
+        }
     }
 }
