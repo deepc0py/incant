@@ -7,10 +7,12 @@ use anyhow::{Context as AnyhowContext, Result};
 use std::time::Duration;
 use tokio::net::UnixStream;
 
-/// A generated command together with the daemon's advisory risk assessment.
+/// A generated command together with the daemon's advisory risk assessment
+/// and optional explanation.
 pub struct GeneratedCommand {
     pub command: String,
     pub risk: Option<Assessment>,
+    pub explanation: Option<String>,
 }
 
 /// Send a query to the daemon and return the generated command.
@@ -19,6 +21,7 @@ pub async fn send_query(
     context: Context,
     model: Option<String>,
     temperature: Option<f32>,
+    explain: bool,
 ) -> Result<GeneratedCommand> {
     let socket_path = Config::socket_path()?;
 
@@ -33,7 +36,7 @@ pub async fn send_query(
             )
         })?;
 
-    send_query_to_stream(stream, query, context, model, temperature).await
+    send_query_to_stream(stream, query, context, model, temperature, explain).await
 }
 
 /// Send a query to an existing stream.
@@ -43,12 +46,14 @@ async fn send_query_to_stream(
     context: Context,
     model: Option<String>,
     temperature: Option<f32>,
+    explain: bool,
 ) -> Result<GeneratedCommand> {
     let request = Request {
         query,
         context,
         model,
         temperature,
+        explain,
     };
     let message = Message::Query(request);
 
@@ -68,6 +73,7 @@ async fn send_query_to_stream(
         Ok(GeneratedCommand {
             command,
             risk: response.risk,
+            explanation: response.explanation,
         })
     } else if let Some(error) = response.error {
         Err(anyhow::anyhow!("{}", error))

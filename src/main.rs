@@ -48,6 +48,10 @@ struct Cli {
     #[arg(short = 'm', long, value_name = "MODEL")]
     model: Option<String>,
 
+    /// Also print a short explanation of the command to stderr
+    #[arg(short = 'e', long)]
+    explain: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -118,7 +122,7 @@ async fn main() -> Result<()> {
                 fast: cli.fast,
             };
             // Client mode - send query to daemon
-            handle_query(cli.query, cli.pipe, model_selection).await
+            handle_query(cli.query, cli.pipe, cli.explain, model_selection).await
         }
     }
 }
@@ -584,6 +588,7 @@ fn handle_profiles() -> Result<()> {
 async fn handle_query(
     query: Option<String>,
     pipe_mode: bool,
+    explain: bool,
     model_selection: ModelSelection,
 ) -> Result<()> {
     // Load config to resolve model selection
@@ -634,6 +639,7 @@ async fn handle_query(
         ctx,
         Some(resolved_model),
         Some(resolved_temperature),
+        explain,
     )
     .await
     {
@@ -644,6 +650,11 @@ async fn handle_query(
                 if let Some(risk) = &generated.risk {
                     print_risk_warnings(risk);
                 }
+            }
+            // The explanation is stderr commentary: `2>/dev/null` yields the
+            // bare command, `1>/dev/null` yields the lesson.
+            if let Some(explanation) = &generated.explanation {
+                eprintln!("{}", explanation.trim());
             }
             // Output just the command to stdout
             println!("{}", generated.command);

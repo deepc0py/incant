@@ -18,6 +18,9 @@ pub struct Request {
     /// Temperature override (if specified by client).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Request a short explanation of the generated command.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 /// System context gathered by the client.
@@ -46,6 +49,9 @@ pub struct Response {
     /// Advisory safety assessment of the generated command.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risk: Option<crate::safety::Assessment>,
+    /// Short explanation of the command (present when requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
 }
 
 impl Response {
@@ -55,7 +61,14 @@ impl Response {
             command: Some(command),
             error: None,
             risk: Some(risk),
+            explanation: None,
         }
+    }
+
+    /// Attach an explanation to a successful response.
+    pub fn with_explanation(mut self, explanation: String) -> Self {
+        self.explanation = Some(explanation);
+        self
     }
 
     /// Create a response carrying informational text (e.g. daemon status)
@@ -65,6 +78,7 @@ impl Response {
             command: Some(text),
             error: None,
             risk: None,
+            explanation: None,
         }
     }
 
@@ -74,6 +88,7 @@ impl Response {
             command: None,
             error: Some(message.into()),
             risk: None,
+            explanation: None,
         }
     }
 }
@@ -179,6 +194,7 @@ mod tests {
             },
             model: None,
             temperature: None,
+            explain: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -197,11 +213,35 @@ mod tests {
             },
             model: Some("qwen2.5-coder:1.5b".to_string()),
             temperature: Some(0.2),
+            explain: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("qwen2.5-coder:1.5b"));
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.model, Some("qwen2.5-coder:1.5b".to_string()));
         assert_eq!(parsed.temperature, Some(0.2));
+    }
+
+    #[test]
+    fn test_request_explain_defaults_false_on_the_wire() {
+        // Older clients omit the field; it must deserialize as false.
+        let json = r#"{"query":"x","context":{"cwd":"/","shell":"sh","os":"linux"}}"#;
+        let parsed: Request = serde_json::from_str(json).unwrap();
+        assert!(!parsed.explain);
+
+        let req = Request {
+            query: "x".to_string(),
+            context: Context {
+                cwd: "/".into(),
+                shell: "sh".to_string(),
+                os: "linux".to_string(),
+                distro: None,
+            },
+            model: None,
+            temperature: None,
+            explain: true,
+        };
+        let round: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert!(round.explain);
     }
 }

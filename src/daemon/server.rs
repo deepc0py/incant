@@ -182,7 +182,26 @@ async fn handle_client(
                     if !risk.is_safe() {
                         debug!("Safety findings: {:?}", risk.findings);
                     }
-                    Response::success(command, risk)
+                    if request.explain {
+                        match explain_command(
+                            &backend,
+                            &command,
+                            model_override,
+                            temperature_override,
+                        )
+                        .await
+                        {
+                            Ok(explanation) => {
+                                Response::success(command, risk).with_explanation(explanation)
+                            }
+                            Err(e) => {
+                                error!("Explanation failed: {}", e);
+                                Response::error(format!("Explanation failed: {}", e))
+                            }
+                        }
+                    } else {
+                        Response::success(command, risk)
+                    }
                 }
                 Err(e) => {
                     error!("Generation failed: {}", e);
@@ -212,6 +231,27 @@ async fn handle_client(
     debug!("Response sent");
 
     Ok(())
+}
+
+/// System prompt for the explanation pass. Kept separate from command
+/// generation so each call does exactly one job.
+const EXPLAIN_SYSTEM_PROMPT: &str = "You explain shell commands to someone learning the terminal.\n\nRules:\n- Reply in 1-3 short plain-text lines\n- Describe what the command does and what each notable flag means\n- No markdown, no code fences, no preamble";
+
+/// Ask the backend for a short explanation of an already-generated command.
+async fn explain_command(
+    backend: &Backend,
+    command: &str,
+    model_override: Option<&str>,
+    temperature_override: Option<f32>,
+) -> Result<String> {
+    backend
+        .generate(
+            EXPLAIN_SYSTEM_PROMPT,
+            command,
+            model_override,
+            temperature_override,
+        )
+        .await
 }
 
 /// Check if the daemon is running.
