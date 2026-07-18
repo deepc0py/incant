@@ -1,6 +1,6 @@
-//! Configuration management for incant.
+//! Cross-platform configuration management for incant.
 //!
-//! Configuration is loaded from `~/.config/incant/config.toml`.
+//! Unix uses the XDG config location; Windows uses LocalAppData.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,7 @@ fn default_true() -> bool {
 ///
 /// `$XDG_CONFIG_HOME/incant` when set and non-empty, else
 /// `<home>/.config/incant`.
+#[cfg(unix)]
 fn config_dir_from(
     xdg_config_home: Option<std::ffi::OsString>,
     home: Option<PathBuf>,
@@ -157,6 +158,15 @@ fn config_dir_from(
     }
     home.map(|p| p.join(".config/incant"))
         .context("Could not determine home directory")
+}
+
+#[cfg(windows)]
+fn windows_config_dir_from(local_app_data: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    local_app_data
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|path| path.join("incant"))
+        .context("LOCALAPPDATA is required on Windows")
 }
 
 /// Model selection options from CLI.
@@ -233,16 +243,20 @@ impl ModelSelection {
 }
 
 impl Config {
-    /// Get the config directory path.
+    /// Get the platform's per-user configuration directory.
     ///
-    /// XDG semantics on every Unix platform: `$XDG_CONFIG_HOME/incant`,
-    /// falling back to `~/.config/incant`. CLI tools live in `~/.config`
-    /// on macOS too — this is what every doc for this project promises
-    /// (previously `dirs::config_dir()` silently resolved to
-    /// `~/Library/Application Support` on macOS, so documented configs
-    /// were ignored; see issue #22).
+    /// Unix uses `$XDG_CONFIG_HOME/incant`, falling back to
+    /// `~/.config/incant`. Windows uses `%LOCALAPPDATA%\incant` and fails
+    /// closed when `LOCALAPPDATA` is unavailable.
     pub fn config_dir() -> Result<PathBuf> {
-        config_dir_from(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir())
+        #[cfg(unix)]
+        {
+            config_dir_from(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir())
+        }
+        #[cfg(windows)]
+        {
+            windows_config_dir_from(std::env::var_os("LOCALAPPDATA"))
+        }
     }
 
     /// Get the config file path.
@@ -250,20 +264,29 @@ impl Config {
         Ok(Self::config_dir()?.join("config.toml"))
     }
 
-    /// Get the per-user runtime directory holding the socket, PID, and
-    /// startup-status files: `$XDG_RUNTIME_DIR` (already private per spec)
-    /// or `~/.local/run` as the fallback.
+    /// Get the platform's per-user daemon state directory.
+    ///
+    /// Unix uses `$XDG_RUNTIME_DIR`, falling back to `~/.local/run`. Windows
+    /// uses `%LOCALAPPDATA%\incant\run`.
     pub fn runtime_dir() -> Result<PathBuf> {
-        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            Ok(PathBuf::from(runtime_dir))
-        } else {
-            dirs::home_dir()
-                .map(|p| p.join(".local/run"))
-                .context("Could not determine home directory")
+        #[cfg(unix)]
+        {
+            if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+                Ok(PathBuf::from(runtime_dir))
+            } else {
+                dirs::home_dir()
+                    .map(|p| p.join(".local/run"))
+                    .context("Could not determine home directory")
+            }
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self::config_dir()?.join("run"))
         }
     }
 
     /// Get the socket path for daemon communication.
+    #[cfg(unix)]
     pub fn socket_path() -> Result<PathBuf> {
         Ok(Self::runtime_dir()?.join("incant.sock"))
     }
@@ -281,7 +304,29 @@ impl Config {
     /// Load configuration from file, using defaults if not found.
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
-        if path.exists() {
+        #[cfg(unix)]
+        let exists = path.exists();
+        #[cfg(windows)]
+        let exists = match std::fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect config file: {}", path.display()));
+            }
+        };
+        if exists {
+            #[cfg(windows)]
+            {
+                let parent = path
+                    .parent()
+                    .context("Config path has no parent directory")?;
+                crate::transport::ensure_private_directory(parent).with_context(|| {
+                    format!("Failed to secure config directory: {}", parent.display())
+                })?;
+                crate::transport::secure_existing_file(&path)
+                    .with_context(|| format!("Failed to secure config file: {}", path.display()))?;
+            }
             let contents = std::fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read config file: {}", path.display()))?;
             toml::from_str(&contents)
@@ -293,23 +338,21 @@ impl Config {
 
     /// Save configuration to file.
     ///
-    /// The config may contain API keys, so the directory is created 0700
-    /// and the file is written 0600.
+    /// The config may contain API keys, so it is written through the
+    /// platform's current-user-only file and directory security boundary.
     pub fn save(&self) -> Result<()> {
         self.save_to(&Self::config_path()?)
     }
 
     /// Save configuration to an explicit path (separated for testability).
     fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("Failed to create config directory: {}", parent.display())
             })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-            }
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
         let contents = toml::to_string_pretty(self)?;
         #[cfg(unix)]
@@ -327,9 +370,9 @@ impl Config {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             file.write_all(contents.as_bytes())?;
         }
-        #[cfg(not(unix))]
-        std::fs::write(path, &contents)
-            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+        #[cfg(windows)]
+        crate::transport::write_private_file(path, contents.as_bytes())
+            .with_context(|| format!("Failed to securely write config file: {}", path.display()))?;
         Ok(())
     }
 
@@ -444,6 +487,7 @@ CWD: {}{}"#,
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn config_dir_prefers_xdg_config_home() {
         let dir = config_dir_from(
@@ -454,16 +498,27 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/custom/xdg/incant"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn config_dir_falls_back_to_dot_config() {
         let dir = config_dir_from(None, Some(PathBuf::from("/home/user"))).unwrap();
         assert_eq!(dir, PathBuf::from("/home/user/.config/incant"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn config_dir_ignores_empty_xdg() {
         let dir = config_dir_from(Some("".into()), Some(PathBuf::from("/home/user"))).unwrap();
         assert_eq!(dir, PathBuf::from("/home/user/.config/incant"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_dir_uses_local_app_data() {
+        let dir = windows_config_dir_from(Some(r"C:\Users\user\AppData\Local".into())).unwrap();
+        assert_eq!(dir, PathBuf::from(r"C:\Users\user\AppData\Local\incant"));
+        assert!(windows_config_dir_from(None).is_err());
+        assert!(windows_config_dir_from(Some("".into())).is_err());
     }
 
     #[test]

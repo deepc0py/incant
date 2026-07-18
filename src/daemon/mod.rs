@@ -2,7 +2,7 @@
 //!
 //! The daemon is a long-running process that:
 //! - Holds the LLM connection (Ollama or API)
-//! - Listens on a Unix domain socket
+//! - Listens on the platform-native same-user IPC endpoint
 //! - Pre-caches the system prompt
 //! - Handles inference requests
 
