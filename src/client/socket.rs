@@ -55,7 +55,7 @@ async fn send_query_to_stream(
         temperature,
         explain,
     };
-    let message = Message::Query(request);
+    let message = Message::Query(Box::new(request));
 
     // Send the request
     framing::write_message(&mut stream, &message).await?;

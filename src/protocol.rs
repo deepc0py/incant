@@ -35,6 +35,18 @@ pub struct Context {
     /// Linux distribution info (from /etc/os-release).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distro: Option<String>,
+    /// Detected project types in cwd (e.g. "rust", "node").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
+    /// Modern CLI tools available on PATH (e.g. "rg", "fd", "jq").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Git state of cwd, e.g. "branch main, dirty". None outside a repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<String>,
+    /// Environment flags: "ssh", "tmux", "docker".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_flags: Vec<String>,
 }
 
 /// Response sent from daemon to client.
@@ -98,7 +110,7 @@ impl Response {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
     /// A query request from the client.
-    Query(Request),
+    Query(Box<Request>),
     /// Request daemon status.
     Status,
     /// Shutdown the daemon gracefully.
@@ -191,6 +203,10 @@ mod tests {
                 shell: "/bin/zsh".to_string(),
                 os: "Linux 5.15.0".to_string(),
                 distro: Some("Ubuntu 22.04".to_string()),
+                projects: Vec::new(),
+                tools: Vec::new(),
+                git: None,
+                env_flags: Vec::new(),
             },
             model: None,
             temperature: None,
@@ -210,6 +226,10 @@ mod tests {
                 shell: "/bin/zsh".to_string(),
                 os: "Linux 5.15.0".to_string(),
                 distro: None,
+                projects: Vec::new(),
+                tools: Vec::new(),
+                git: None,
+                env_flags: Vec::new(),
             },
             model: Some("qwen2.5-coder:1.5b".to_string()),
             temperature: Some(0.2),
@@ -236,6 +256,10 @@ mod tests {
                 shell: "sh".to_string(),
                 os: "linux".to_string(),
                 distro: None,
+                projects: Vec::new(),
+                tools: Vec::new(),
+                git: None,
+                env_flags: Vec::new(),
             },
             model: None,
             temperature: None,

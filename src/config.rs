@@ -334,10 +334,16 @@ impl Config {
 
     /// Build the system prompt based on context and preferences.
     pub fn build_system_prompt(&self, context: &crate::protocol::Context) -> String {
-        let modern_tools_note = if self.preferences.modern_tools {
+        let modern_tools_note = if !self.preferences.modern_tools {
+            "- Use standard POSIX tools (grep, find, cat)".to_string()
+        } else if context.tools.is_empty() {
             "- Use modern tools when appropriate (ripgrep over grep, fd over find, bat over cat)"
+                .to_string()
         } else {
-            "- Use standard POSIX tools (grep, find, cat)"
+            format!(
+                "- Prefer these installed modern tools over classic equivalents: {}",
+                context.tools.join(", ")
+            )
         };
 
         let flags_note = if self.preferences.verbose_flags {
@@ -351,6 +357,17 @@ impl Config {
             .as_ref()
             .map(|d| format!("\nDistro: {}", d))
             .unwrap_or_default();
+
+        let mut extra = String::new();
+        if !context.projects.is_empty() {
+            extra.push_str(&format!("\nProject: {}", context.projects.join(", ")));
+        }
+        if let Some(git) = &context.git {
+            extra.push_str(&format!("\nGit: {}", git));
+        }
+        if !context.env_flags.is_empty() {
+            extra.push_str(&format!("\nEnvironment: {}", context.env_flags.join(", ")));
+        }
 
         format!(
             r#"You are a shell command generator. Your ONLY output is the exact command to run.
@@ -367,13 +384,14 @@ Rules:
 Context:
 OS: {}{}
 Shell: {}
-CWD: {}"#,
+CWD: {}{}"#,
             modern_tools_note,
             flags_note,
             context.os,
             distro_info,
             context.shell,
-            context.cwd.display()
+            context.cwd.display(),
+            extra
         )
     }
 }
@@ -389,6 +407,51 @@ mod tests {
         assert!(config.preferences.modern_tools);
         assert!(config.profiles.contains_key("default"));
         assert!(config.profiles.contains_key("fast"));
+    }
+
+    fn ctx(projects: Vec<&str>, tools: Vec<&str>, git: Option<&str>) -> crate::protocol::Context {
+        crate::protocol::Context {
+            cwd: "/work/demo".into(),
+            shell: "/bin/zsh".to_string(),
+            os: "Darwin 25.3.0".to_string(),
+            distro: None,
+            projects: projects.into_iter().map(String::from).collect(),
+            tools: tools.into_iter().map(String::from).collect(),
+            git: git.map(String::from),
+            env_flags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prompt_renders_enriched_context() {
+        let config = Config::default();
+        let prompt = config.build_system_prompt(&ctx(
+            vec!["rust"],
+            vec!["rg", "fd"],
+            Some("branch main, dirty"),
+        ));
+        assert!(prompt.contains("Project: rust"));
+        assert!(prompt.contains("Git: branch main, dirty"));
+        assert!(prompt.contains("installed modern tools over classic equivalents: rg, fd"));
+    }
+
+    #[test]
+    fn prompt_omits_absent_context_sections() {
+        let config = Config::default();
+        let prompt = config.build_system_prompt(&ctx(vec![], vec![], None));
+        assert!(!prompt.contains("Project:"));
+        assert!(!prompt.contains("Git:"));
+        // Without a tool probe result, fall back to generic advice.
+        assert!(prompt.contains("Use modern tools when appropriate"));
+    }
+
+    #[test]
+    fn prompt_respects_posix_preference_over_probe() {
+        let mut config = Config::default();
+        config.preferences.modern_tools = false;
+        let prompt = config.build_system_prompt(&ctx(vec![], vec!["rg"], None));
+        assert!(prompt.contains("standard POSIX tools"));
+        assert!(!prompt.contains("installed modern tools"));
     }
 
     #[test]
