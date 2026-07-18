@@ -31,7 +31,7 @@ param(
     [string] $InstallDir = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Incant\bin'),
 
     [ValidateNotNullOrEmpty()]
-    [string] $ConfigDir = (Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'incant'),
+    [string] $ConfigDir = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'incant'),
 
     [ValidateNotNullOrEmpty()]
     [string] $ProfilePath = $PROFILE.CurrentUserAllHosts
@@ -198,18 +198,31 @@ function Invoke-IncantDownload {
     Invoke-WebRequest -Uri $Uri -OutFile $Destination
 }
 
+function ConvertFrom-IncantReleaseTag {
+    param([Parameter(Mandatory)][string] $Tag)
+
+    $version = $Tag.Trim()
+    if ($version.StartsWith('v', [StringComparison]::OrdinalIgnoreCase)) {
+        $version = $version.Substring(1)
+    }
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        throw "Invalid Incant release tag: '$Tag'."
+    }
+    $version
+}
+
 function Resolve-IncantReleaseVersion {
     param([Parameter(Mandatory)][string] $RequestedVersion)
 
     if ($RequestedVersion -ne 'latest') {
-        return $RequestedVersion.TrimStart('v')
+        return ConvertFrom-IncantReleaseTag $RequestedVersion
     }
 
     $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/deepc0py/incant/releases/latest'
     if ([string]::IsNullOrWhiteSpace($release.tag_name)) {
         throw 'The latest GitHub release did not include a tag name.'
     }
-    ([string] $release.tag_name).TrimStart('v')
+    ConvertFrom-IncantReleaseTag ([string] $release.tag_name)
 }
 
 function Get-IncantWindowsTarget {
@@ -378,7 +391,7 @@ function Invoke-IncantInstaller {
         [Parameter(ParameterSetName = 'Source')][string] $SourcePath = $PSScriptRoot,
         [Parameter(ParameterSetName = 'Uninstall')][switch] $RemoveConfig,
         [string] $InstallDir = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Incant\bin'),
-        [string] $ConfigDir = (Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'incant'),
+        [string] $ConfigDir = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'incant'),
         [string] $ProfilePath = $PROFILE.CurrentUserAllHosts
     )
 

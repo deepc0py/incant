@@ -48,6 +48,38 @@ Describe 'install.ps1' {
         $env:HOME = $script:OriginalHome
     }
 
+    It 'normalizes a leading v for the tag URL but not the archive basename' {
+        Invoke-IncantInstaller -Version 'v1.2.3' -InstallDir $script:InstallDir `
+            -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath
+
+        Should -Invoke Invoke-IncantDownload -Times 1 -Exactly -ParameterFilter {
+            $Uri.AbsoluteUri -eq 'https://github.com/deepc0py/incant/releases/download/v1.2.3/incant-1.2.3-x86_64-pc-windows-msvc.zip'
+        }
+        Should -Invoke Invoke-IncantDownload -Times 1 -Exactly -ParameterFilter {
+            $Uri.AbsoluteUri -eq 'https://github.com/deepc0py/incant/releases/download/v1.2.3/SHA256SUMS'
+        }
+    }
+
+    It 'selects the checksum for the exact zip basename' {
+        $actualHash = (Get-FileHash -LiteralPath $script:ArchivePath -Algorithm SHA256).Hash
+        Set-Content -LiteralPath $script:ChecksumPath -Value @(
+            \"$('0' * 64)  incant-1.2.3-aarch64-pc-windows-msvc.zip\"
+            \"$actualHash  $($script:AssetName)\"
+        )
+
+        {
+            Assert-IncantArchiveChecksum -ArchivePath $script:ArchivePath `
+                -ChecksumPath $script:ChecksumPath -AssetName $script:AssetName
+        } | Should -Not -Throw
+
+        Set-Content -LiteralPath $script:ChecksumPath `
+            -Value \"$('0' * 64)  incant-1.2.3-aarch64-pc-windows-msvc.zip\"
+        {
+            Assert-IncantArchiveChecksum -ArchivePath $script:ArchivePath `
+                -ChecksumPath $script:ChecksumPath -AssetName $script:AssetName
+        } | Should -Throw \"*checksum for $($script:AssetName) was not found*\"
+    }
+
     It 'is idempotent and preserves an existing config' {
         Invoke-IncantInstaller -Version '1.2.3' -InstallDir $script:InstallDir `
             -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath
