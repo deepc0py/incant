@@ -1,0 +1,62 @@
+name: Bug report
+description: Report incorrect behavior in incant
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: incant version
+      description: Output of `incant --version`.
+      placeholder: incant 0.2.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: OS and version (e.g. macOS 15.5, Ubuntu 24.04).
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - ollama
+        - anthropic
+        - openai
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands run, including flags and any relevant config.
+      placeholder: |
+        1. incant --pipe "find large files"
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead, including full error output.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon logs
+      description: >-
+        Stop any running daemon (`incant daemon stop`), run it in the
+        foreground with `incant daemon run`, reproduce the bug from another
+        terminal, and paste the relevant log lines here. `RUST_LOG=debug`
+        increases verbosity.
+      render: text
