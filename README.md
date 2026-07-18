@@ -7,7 +7,7 @@
 
 Natural language to shell commands. Instantly.
 
-`incant` is a terminal-native command translator written in Rust. Press **Ctrl+K**, describe what you want, get the exact command. Sub-500ms with local models, under a second with cloud APIs. No copy-paste, no browser, no context switching.
+`incant` is an AI-powered command-line tool that turns natural language into shell commands, written in Rust and built for local LLMs. Press **Ctrl+K**, describe what you want, get the exact command. Sub-500ms with on-device models via Ollama, under a second with Claude or GPT. No copy-paste, no browser, no context switching -- and by default, nothing leaves your machine.
 
 ```
   $ ctrl+k
@@ -231,6 +231,15 @@ Local-first by design: the default Ollama backend keeps queries, context, and ge
 | Daemon memory (idle) | <50MB |
 
 The release binary is built with LTO, single codegen unit, symbol stripping, and panic=abort.
+
+## How it compares
+
+| Tool | Difference |
+|---|---|
+| **GitHub Copilot CLI** | Cloud-only and subscription-gated. incant runs free local models by default; cloud is opt-in. |
+| **thefuck** | Corrects a command *after* it fails. incant generates the right command before you run anything. |
+| **shell-gpt / zsh-codex** | Python scripts calling cloud APIs per keystroke. incant is a compiled Rust daemon: warm connections, sub-500ms local inference, safety warnings, no interpreter startup. |
+| **Warp AI** | A whole terminal replacement. incant is one keybinding inside the shell you already use. |
 
 ## Where this is going
 
