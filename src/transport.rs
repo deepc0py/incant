@@ -785,12 +785,60 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn current_primary_group() -> std::io::Result<OwnedSid> {
+        use windows_sys::Win32::Security::{TokenPrimaryGroup, TOKEN_PRIMARY_GROUP};
+
+        let mut token: HANDLE = null_mut();
+        // SAFETY: `token` is a valid out pointer; the pseudo-process handle is
+        // always valid for the current process.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let token = OwnedHandle::new(token)?;
+
+        let mut byte_len = 0;
+        // SAFETY: the documented sizing call uses a null buffer and zero size.
+        let sized = unsafe {
+            GetTokenInformation(token.0, TokenPrimaryGroup, null_mut(), 0, &mut byte_len)
+        };
+        if sized != 0
+            || std::io::Error::last_os_error().raw_os_error()
+                != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if byte_len < size_of::<TOKEN_PRIMARY_GROUP>() as u32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "TokenPrimaryGroup buffer is unexpectedly small",
+            ));
+        }
+
+        let words = (byte_len as usize).div_ceil(size_of::<usize>());
+        let mut token_info = vec![0usize; words];
+        // SAFETY: the aligned allocation is at least `byte_len` bytes long.
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenPrimaryGroup,
+                token_info.as_mut_ptr() as *mut c_void,
+                byte_len,
+                &mut byte_len,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: GetTokenInformation initialized a TOKEN_PRIMARY_GROUP.
+        let group = unsafe { &*(token_info.as_ptr() as *const TOKEN_PRIMARY_GROUP) };
+        OwnedSid::copy_from(group.PrimaryGroup)
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn windows_pipe_security_and_owner_are_verified_before_framing() {
         use crate::protocol::framing;
         use tokio::io::AsyncReadExt;
-        use windows_sys::Win32::Security::{ImpersonateAnonymousToken, RevertToSelf};
-        use windows_sys::Win32::System::Threading::GetCurrentThread;
 
         let endpoint = endpoint().unwrap();
         let mut listener = Listener::bind(&endpoint).unwrap();
@@ -841,22 +889,31 @@ mod tests {
         assert_eq!(response, "secure");
         server.await.unwrap();
 
-        // Build an adversarial live pipe owned by Anonymous while retaining an
-        // allow-GA ACE for the current user. Normal connect must reject its
-        // kernel owner before the server can observe even a frame length byte.
+        // Build an adversarial live pipe owned by the token's primary group
+        // while retaining an allow-GA ACE for the current user. The primary
+        // group is owner-assignable but is not the user's SID, so normal
+        // connect must reject its kernel owner before the server can observe
+        // even a frame length byte.
         let user = CurrentUser::load().unwrap();
-        let mut descriptor =
-            SecurityDescriptor::from_sddl(&format!("O:S-1-5-7D:P(A;;GA;;;{})", user.sid_string))
-                .unwrap();
+        let primary_group = current_primary_group().unwrap();
+        assert_eq!(
+            unsafe { EqualSid(primary_group.as_psid(), user.sid.as_psid()) },
+            0
+        );
+        let mut descriptor = SecurityDescriptor::from_sddl(&format!(
+            "O:{}D:P(A;;GA;;;{})",
+            primary_group.to_string().unwrap(),
+            user.sid_string
+        ))
+        .unwrap();
         let mut attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.as_mut_ptr(),
             bInheritHandle: 0,
         };
         let mut options = ServerOptions::new();
-        // SAFETY: the pseudo-handle is valid, and attributes points to a live
-        // self-relative descriptor for the duration of CreateNamedPipeW.
-        assert_ne!(unsafe { ImpersonateAnonymousToken(GetCurrentThread()) }, 0);
+        // SAFETY: attributes references a live self-relative descriptor for
+        // the duration of CreateNamedPipeW.
         let wrong_owner = unsafe {
             options
                 .reject_remote_clients(true)
@@ -866,8 +923,6 @@ mod tests {
                     &mut attributes as *mut _ as *mut std::ffi::c_void,
                 )
         };
-        // SAFETY: this thread successfully entered anonymous impersonation.
-        assert_ne!(unsafe { RevertToSelf() }, 0);
         let mut wrong_owner = wrong_owner.unwrap();
 
         let observer = tokio::spawn(async move {
