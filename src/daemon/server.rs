@@ -46,10 +46,13 @@ impl DaemonServer {
 
     /// Inner run logic that can fail during startup.
     async fn run_inner(&self) -> Result<()> {
-        // Ensure parent directory exists
+        // Ensure the runtime directory exists and is private. XDG_RUNTIME_DIR
+        // is 0700 per spec; the ~/.local/run fallback is created (or
+        // tightened) to 0700 so no other local user can reach the socket,
+        // even during the window between bind() and chmod below.
         if let Some(parent) = self.socket_path.parent() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("Failed to create socket directory: {}", parent.display())
+            ensure_private_dir(parent).with_context(|| {
+                format!("Failed to secure socket directory: {}", parent.display())
             })?;
         }
 
@@ -80,9 +83,17 @@ impl DaemonServer {
             self.backend.model()
         );
 
-        // Bind to the socket
+        // Bind to the socket, then restrict it to the owning user. The
+        // private parent directory above already blocks access during the
+        // bind-to-chmod window; this is defense in depth.
         let listener = UnixListener::bind(&self.socket_path)
             .with_context(|| format!("Failed to bind to socket: {}", self.socket_path.display()))?;
+        restrict_to_owner(&self.socket_path).with_context(|| {
+            format!(
+                "Failed to restrict socket permissions: {}",
+                self.socket_path.display()
+            )
+        })?;
 
         info!("Daemon listening on {}", self.socket_path.display());
 
@@ -300,4 +311,75 @@ pub async fn get_daemon_pid() -> Option<u32> {
         }
     }
     None
+}
+
+/// Create `dir` if needed and ensure it is accessible only by its owner
+/// (mode 0700). Applies to pre-existing directories too, so a loose
+/// `~/.local/run` from an earlier install gets tightened.
+fn ensure_private_dir(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            info!("Tightened permissions on {} to 0700", dir.display());
+        }
+    }
+    Ok(())
+}
+
+/// Restrict a filesystem entry (the daemon socket) to owner read/write.
+fn restrict_to_owner(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_private_dir_creates_with_0700() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("run");
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_private_dir_tightens_existing_loose_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("run");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bound_socket_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("t.sock");
+        let _listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        restrict_to_owner(&sock).unwrap();
+        assert_eq!(mode_of(&sock), 0o600);
+    }
 }
