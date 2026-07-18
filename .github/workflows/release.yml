@@ -1,7 +1,8 @@
-# Release automation: pushing a v* tag builds binaries for five targets
-# (tarballs for Linux/macOS, a zip for Windows), smoke-tests each one,
-# and publishes a GitHub Release with SHA-256 checksums. Actions pinned
-# to full commit SHAs; only the publish job holds a write token.
+# Release automation: pushing a v* tag builds binaries for six targets
+# (tarballs for Linux/macOS, zips for Windows), smoke-tests each one
+# where the runner can execute it, and publishes a GitHub Release with
+# SHA-256 checksums. Actions pinned to full commit SHAs; only the
+# publish job holds a write token.
 
 name: Release
 
@@ -32,6 +33,8 @@ jobs:
             os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -54,14 +57,17 @@ jobs:
         if: runner.os != 'Windows'
         run: ./target/${{ matrix.target }}/release/incant --version
 
-      # The Windows binary must answer from both supported entry points.
+      # The x86_64 Windows binary must answer from both supported entry
+      # points. aarch64-pc-windows-msvc is cross-compiled: GitHub's x64
+      # Windows runner cannot execute ARM64 binaries, so its native smoke
+      # test runs in the Windows 11 ARM VM before the release is cut.
       - name: Smoke test (pwsh)
-        if: runner.os == 'Windows'
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: '& ./target/${{ matrix.target }}/release/incant.exe --version'
 
       - name: Smoke test (CMD)
-        if: runner.os == 'Windows'
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: cmd
         run: target\${{ matrix.target }}\release\incant.exe --version
 
