@@ -2,9 +2,16 @@
 
 use crate::config::Config;
 use crate::protocol::{framing, Context, Message, Request, Response};
+use crate::safety::Assessment;
 use anyhow::{Context as AnyhowContext, Result};
 use std::time::Duration;
 use tokio::net::UnixStream;
+
+/// A generated command together with the daemon's advisory risk assessment.
+pub struct GeneratedCommand {
+    pub command: String,
+    pub risk: Option<Assessment>,
+}
 
 /// Send a query to the daemon and return the generated command.
 pub async fn send_query(
@@ -12,7 +19,7 @@ pub async fn send_query(
     context: Context,
     model: Option<String>,
     temperature: Option<f32>,
-) -> Result<String> {
+) -> Result<GeneratedCommand> {
     let socket_path = Config::socket_path()?;
 
     // Connect with timeout
@@ -36,7 +43,7 @@ async fn send_query_to_stream(
     context: Context,
     model: Option<String>,
     temperature: Option<f32>,
-) -> Result<String> {
+) -> Result<GeneratedCommand> {
     let request = Request {
         query,
         context,
@@ -58,7 +65,10 @@ async fn send_query_to_stream(
 
     // Extract the command or error
     if let Some(command) = response.command {
-        Ok(command)
+        Ok(GeneratedCommand {
+            command,
+            risk: response.risk,
+        })
     } else if let Some(error) = response.error {
         Err(anyhow::anyhow!("{}", error))
     } else {

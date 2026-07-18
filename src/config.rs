@@ -123,6 +123,9 @@ pub struct Preferences {
     /// Prefer verbose flags (--recursive over -r).
     #[serde(default = "default_true")]
     pub verbose_flags: bool,
+    /// Show advisory warnings when a generated command looks destructive.
+    #[serde(default = "default_true")]
+    pub safety_warnings: bool,
 }
 
 impl Default for Preferences {
@@ -130,6 +133,7 @@ impl Default for Preferences {
         Self {
             modern_tools: true,
             verbose_flags: true,
+            safety_warnings: true,
         }
     }
 }

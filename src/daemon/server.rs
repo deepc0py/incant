@@ -178,7 +178,11 @@ async fn handle_client(
             {
                 Ok(command) => {
                     debug!("Generated command: {}", command);
-                    Response::success(command)
+                    let risk = crate::safety::assess(&command);
+                    if !risk.is_safe() {
+                        debug!("Safety findings: {:?}", risk.findings);
+                    }
+                    Response::success(command, risk)
                 }
                 Err(e) => {
                     error!("Generation failed: {}", e);
@@ -188,7 +192,7 @@ async fn handle_client(
         }
         Message::Status => {
             // Return status information
-            Response::success(format!("Backend: {} ({})", backend.name(), backend.model()))
+            Response::plain(format!("Backend: {} ({})", backend.name(), backend.model()))
         }
         Message::Shutdown => {
             info!("Received shutdown request");
