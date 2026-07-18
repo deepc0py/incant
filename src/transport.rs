@@ -853,7 +853,7 @@ mod tests {
             lpSecurityDescriptor: descriptor.as_mut_ptr(),
             bInheritHandle: 0,
         };
-        let options = ServerOptions::new();
+        let mut options = ServerOptions::new();
         // SAFETY: the pseudo-handle is valid, and attributes points to a live
         // self-relative descriptor for the duration of CreateNamedPipeW.
         assert_ne!(unsafe { ImpersonateAnonymousToken(GetCurrentThread()) }, 0);
