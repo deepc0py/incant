@@ -1,5 +1,10 @@
 # incant
 
+[![CI](https://github.com/deepc0py/incant/actions/workflows/ci.yml/badge.svg)](https://github.com/deepc0py/incant/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/deepc0py/incant/actions/workflows/codeql.yml/badge.svg)](https://github.com/deepc0py/incant/actions/workflows/codeql.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![MSRV: 1.88](https://img.shields.io/badge/MSRV-1.88-orange.svg)](Cargo.toml)
+
 Natural language to shell commands. Instantly.
 
 `incant` is a terminal-native command translator written in Rust. Press **Ctrl+K**, describe what you want, get the exact command. Sub-500ms with local models, under a second with cloud APIs. No copy-paste, no browser, no context switching.
@@ -18,7 +23,7 @@ Every terminal user has the same experience. You know what you want to do. You c
 
 This happens to everyone. Junior devs, staff engineers, sysadmins who've been at it for twenty years. The command-line surface area is enormous and nobody holds all of it in their head. The friction isn't ignorance -- it's the mismatch between how fast you can think and how slow it is to look things up.
 
-incant closes that gap. It runs as a daemon with your shell context already loaded -- OS, shell, cwd, installed tools. You describe the intent, it returns the exact command. The response comes back in the same terminal where you need it, before you'd have finished typing the URL to search for it.
+incant closes that gap. It runs as a daemon with your shell context already loaded -- OS, shell, cwd, project type, git state, which modern tools you actually have installed. You describe the intent, it returns the exact command. The response comes back in the same terminal where you need it, before you'd have finished typing the URL to search for it.
 
 ## Install
 
@@ -30,7 +35,7 @@ cd incant
 
 The installer builds from source, sets up a default config, optionally installs [Ollama](https://ollama.ai/) with a local model, and wires up the **Ctrl+K** shell binding.
 
-Requires Rust 1.70+ and one of:
+Requires Rust 1.88+ and one of:
 - **Ollama** -- local models, no API key, fully private (recommended)
 - **Anthropic API key** -- Claude
 - **OpenAI API key** -- GPT
@@ -50,6 +55,10 @@ incant "compress this directory excluding node_modules"
 
 incant --pipe "disk usage sorted by size" | sh
 # Pipe mode: no TUI, direct output, scriptable
+
+incant --explain "find files modified in the last hour"
+# fd --changed-within 1h            <- stdout: just the command
+# "fd finds files; --changed-within limits to the last hour"  <- stderr
 ```
 
 ## Usage
@@ -58,6 +67,7 @@ incant --pipe "disk usage sorted by size" | sh
 incant                            # Interactive TUI popup
 incant "query"                    # TUI with pre-filled query
 incant --pipe "query"             # No TUI, direct stdout (for scripting)
+incant --explain "query"          # Also print a short explanation to stderr
 incant --fast "query"             # Use fast profile (smaller/faster model)
 incant --profile heavy "query"    # Use a named profile
 incant --model gpt-4o "query"     # Override model directly
@@ -68,6 +78,18 @@ incant config                     # Open config in $EDITOR
 incant profiles                   # List available profiles
 incant install                    # Show shell integration setup
 ```
+
+## Safety Warnings
+
+The whole premise of incant is that you might not fully know the command you asked for. So the daemon inspects every generated command against a tested rule table -- broad recursive deletes, raw disk writes, `curl | sh`, fork bombs, force-pushes, SQL drops, and friends -- and warns on stderr before you press Enter:
+
+```
+$ incant --pipe "delete everything"
+!! destructive: recursively force-deletes the filesystem root, home directory, or everything in the current directory
+rm -rf /
+```
+
+Three levels: `safe` (silence), `caution`, `destructive`. Warnings never touch stdout, so pipes and shell integration stay clean. This is an advisory guardrail against accidents, not a sandbox -- incant never executes anything; you always review the command yourself. Disable with `safety_warnings = false` under `[preferences]`.
 
 ## Architecture
 
@@ -143,8 +165,9 @@ temperature = 0.1
 
 ```toml
 [preferences]
-modern_tools = true    # prefer rg/fd/bat over grep/find/cat
-verbose_flags = true   # prefer --recursive over -r
+modern_tools = true      # prefer rg/fd/bat over grep/find/cat
+verbose_flags = true     # prefer --recursive over -r
+safety_warnings = true   # warn on stderr for destructive commands
 ```
 
 See [`config.example.toml`](config.example.toml) for the full reference.
@@ -193,6 +216,10 @@ bind \ck _incant_fish
 The `</dev/tty` redirect is required for the TUI to work inside shell widgets.
 </details>
 
+## Security & Privacy
+
+Local-first by design: the default Ollama backend keeps queries, context, and generated commands entirely on-device. Cloud backends are an explicit opt-in config edit. The daemon socket is owner-only (`0600` inside a `0700` runtime dir), config files holding API keys are written `0600`, and shell history is never read. The full threat model -- including what incant deliberately does *not* defend against -- lives in [SECURITY.md](SECURITY.md). Report vulnerabilities via [private advisory](https://github.com/deepc0py/incant/security/advisories/new), not public issues.
+
 ## Performance
 
 | Metric | Value |
@@ -226,8 +253,10 @@ cargo build --release
 ```
 
 ```bash
-cargo test   # Run tests
+cargo test   # 65 unit tests + 11 end-to-end integration tests (hermetic, no network)
 ```
+
+Development workflow, commit conventions, and the safety-rule testing contract are in [CONTRIBUTING.md](CONTRIBUTING.md). Release history lives in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

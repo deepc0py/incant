@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/deepc0py/incant/security/advisories/new
+    about: Vulnerabilities are handled privately via GitHub security advisories, never public issues. See SECURITY.md.
