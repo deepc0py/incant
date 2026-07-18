@@ -861,7 +861,10 @@ mod tests {
             options
                 .reject_remote_clients(true)
                 .first_pipe_instance(true)
-                .create_with_security_attributes_raw(&endpoint.pipe_name, &mut attributes)
+                .create_with_security_attributes_raw(
+                    &endpoint.pipe_name,
+                    &mut attributes as *mut _ as *mut std::ffi::c_void,
+                )
         };
         // SAFETY: this thread successfully entered anonymous impersonation.
         assert_ne!(unsafe { RevertToSelf() }, 0);
