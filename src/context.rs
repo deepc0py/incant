@@ -228,7 +228,7 @@ $parentName = (Get-Process -Id $target.ParentProcessId -ErrorAction Stop).Proces
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-[Console]::Out.Write(('{0}`t{1}`t{2}`t{3}`t{4}`t{5}' -f $os.Caption, $os.Version, $os.BuildNumber, $PSVersionTable.PSVersion, $elevated, $parentName))
+[Console]::Out.Write(("{0}`t{1}`t{2}`t{3}`t{4}`t{5}" -f $os.Caption, $os.Version, $os.BuildNumber, $PSVersionTable.PSVersion, $elevated, $parentName))
 "#;
     let output = std::process::Command::new(pwsh)
         .args([
