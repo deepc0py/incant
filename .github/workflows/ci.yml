@@ -10,6 +10,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual runs reproduce the same hosted-runner contracts on demand.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,7 +33,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: stable
+          toolchain: 1.97.1
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -44,10 +46,104 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: stable
+          toolchain: 1.97.1
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Separate job (not a matrix on `clippy`) so the existing required
+  # status-check context "clippy" keeps its name. Lints the
+  # cfg(windows) code paths, which never compile on the Linux lane.
+  clippy-windows:
+    name: clippy (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Native ARM64 Windows build and test proof uses the public Windows 11 ARM
+  # runner, including its linker and SDK.
+  build-windows-arm64:
+    name: build (aarch64-pc-windows-msvc)
+    runs-on: windows-11-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build native ARM64 binary
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          cargo build --locked --target aarch64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) {
+              throw "cargo build failed with status $LASTEXITCODE."
+          }
+          $binary = 'target/aarch64-pc-windows-msvc/debug/incant.exe'
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+              throw "Native ARM64 build did not emit $binary."
+          }
+      - name: Test native ARM64 daemon
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          cargo test --locked --bin incant
+          if ($LASTEXITCODE -ne 0) {
+              throw "ARM64 unit tests failed with status $LASTEXITCODE."
+          }
+          cargo test --locked --test windows_daemon_integration -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+              throw "ARM64 daemon integration failed with status $LASTEXITCODE."
+          }
+
+  # Runs the Windows installer's exact Pester contract under pwsh 7.4+.
+  # Install the exact parser/test engine version; never drift to a runner
+  # image's bundled Pester or an unpinned gallery release.
+  pester-windows:
+    name: pester (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run installer Pester suite
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          if ($PSVersionTable.PSVersion -lt [version] '7.4') {
+              throw "pwsh 7.4+ required; runner has $($PSVersionTable.PSVersion)."
+          }
+          Install-Module Pester `
+              -RequiredVersion 6.0.1 `
+              -Repository PSGallery `
+              -Scope CurrentUser `
+              -Force `
+              -AllowClobber `
+              -ErrorAction Stop
+          Import-Module Pester -RequiredVersion 6.0.1 -Force -ErrorAction Stop
+          $loadedVersion = (Get-Module Pester).Version
+          if ($loadedVersion -ne [version] '6.0.1') {
+              throw "Pester 6.0.1 required; loaded $loadedVersion."
+          }
+          $result = Invoke-Pester -Path tests/install.Tests.ps1 -Output Detailed -PassThru
+          if ($result.TotalCount -ne 16) {
+              throw "Pester discovered $($result.TotalCount) tests; expected exactly 16."
+          }
+          if ($result.FailedCount -ne 0) {
+              throw "Pester: $($result.FailedCount) of $($result.TotalCount) tests failed."
+          }
 
   test:
     name: test (${{ matrix.os }})
@@ -62,7 +158,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: stable
+          toolchain: 1.97.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - if: matrix.os != 'windows-latest'
         run: cargo test --locked
@@ -75,6 +171,21 @@ jobs:
         run: cargo test --locked --test windows_daemon_integration -- --nocapture --test-threads=1
         timeout-minutes: 5
 
+  msrv:
+    name: MSRV (Rust 1.88.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: msrv-1.88.0
+      - run: cargo test --locked
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
@@ -84,7 +195,8 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
+          fallback: none
       - run: cargo audit --deny warnings
 
   deny:
@@ -97,3 +209,166 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+
+  workflow-contract:
+    name: release workflow contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Validate fail-closed release invariants
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          release = Path(".github/workflows/release.yml").read_text()
+          ci = Path(".github/workflows/ci.yml").read_text()
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          def job(name):
+              match = re.search(
+                  rf"(?ms)^  {re.escape(name)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9-]+:\n|\Z)",
+                  release,
+              )
+              require(match is not None, f"missing release job: {name}")
+              return match.group("body")
+
+          expected_targets = [
+              "x86_64-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "aarch64-apple-darwin",
+              "x86_64-pc-windows-msvc",
+              "aarch64-pc-windows-msvc",
+          ]
+          targets = re.findall(r"(?m)^          - target: (\S+)$", job("build"))
+          require(targets == expected_targets, f"release target matrix changed: {targets}")
+
+          toolchains = re.findall(r"(?m)^\s+toolchain:\s*(\S+)\s*$", release)
+          require(
+              toolchains and set(toolchains) == {"1.97.1"},
+              f"release Rust toolchain must be exactly 1.97.1: {toolchains}",
+          )
+          require(
+              "MSRV (Rust 1.88.0)" in ci
+              and "toolchain: 1.88.0" in ci,
+              "CI must retain a distinct Rust 1.88.0 MSRV job",
+          )
+          native_runner_contracts = (
+              "target: aarch64-unknown-linux-gnu\n            os: ubuntu-24.04-arm",
+              "target: x86_64-apple-darwin\n            os: macos-15-intel",
+              "target: aarch64-apple-darwin\n            os: macos-latest",
+              "target: aarch64-pc-windows-msvc\n            os: windows-11-arm",
+          )
+          for mapping in native_runner_contracts:
+              require(mapping in job("build"), f"release native runner mapping changed: {mapping}")
+          require(
+              "tool: cargo-auditable@0.7.5" in job("build")
+              and ("fallback:" + " none") in job("build")
+              and ("cargo auditable build --release --locked --target $" + "{{ matrix.target }}") in job("build"),
+              "release must install exact cargo-auditable without fallback and use it to build",
+          )
+          for package in ("incant", "tokio", "serde", "clap"):
+              require(
+                  release.count(f"'{package}'") >= 2,
+                  f"substantive SBOM gates must require {package}",
+              )
+
+          provenance = job("provenance")
+          private_e2e = job("verify-windows-candidate")
+          prerelease = job("publish-prerelease")
+          public_e2e = job("verify-windows-release")
+          public_attestations = job("verify-release-attestations")
+          promote = job("promote")
+          rollback = job("rollback-release")
+          tag_only = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+          for name, body in (
+              ("publish-prerelease", prerelease),
+              ("verify-windows-release", public_e2e),
+              ("verify-release-attestations", public_attestations),
+              ("promote", promote),
+          ):
+              require(tag_only in body, f"{name} must skip workflow_dispatch")
+          require(
+              "needs: assemble" in provenance
+              and "subject-checksums: dist/SHA256SUMS" in provenance
+              and "subject-path: dist/SHA256SUMS" in provenance
+              and provenance.count("uses: actions/attest@") == 2,
+              "provenance must attest all payload checksums and the aggregate manifest before E2E",
+          )
+          require(
+              "needs: [validate-tag, assemble, provenance]" in private_e2e
+              and "INCANT_E2E_SOURCE: artifact" in private_e2e
+              and "steps: &windows-release-e2e" in private_e2e
+              and 'ReleaseBaseUri = "http://127.0.0.1:$assetPort"' in private_e2e,
+              "private E2E must use exact assembled assets through the loopback installer path",
+          )
+          require(
+              "needs: [validate-tag, assemble, provenance, verify-windows-candidate]" in prerelease
+              and "environment: release" in prerelease
+              and "--draft" in prerelease
+              and "--draft=false" in prerelease
+              and "--prerelease" in prerelease
+              and "--latest=false" in prerelease,
+              "only a verified private candidate may become a public prerelease",
+          )
+          require(
+              "needs: [validate-tag, publish-prerelease]" in public_e2e
+              and "INCANT_E2E_SOURCE: public" in public_e2e
+              and "steps: *windows-release-e2e" in public_e2e
+              and "os: windows-latest" in public_e2e
+              and "os: windows-11-arm" in public_e2e,
+              "public prerelease E2E must reuse the full lifecycle proof on native x64 and ARM64",
+          )
+          require(
+              "needs: [publish-prerelease]" in public_attestations
+              and 'gh release download "$GITHUB_REF_NAME"' in public_attestations
+              and 'gh attestation verify "dist/$asset"' in public_attestations,
+              "every downloaded public asset must be checksum and provenance verified",
+          )
+          require(
+              "needs: [verify-windows-release, verify-release-attestations]" in promote
+              and "environment: release" in promote
+              and "--prerelease=false" in promote
+              and "--latest" in promote,
+              "stable promotion must follow public E2E and public attestation verification",
+          )
+          require(
+              "needs.promote.result != 'success'" in rollback
+              and 'gh release delete "$GITHUB_REF_NAME" --yes' in rollback
+              and "git/refs/tags/$GITHUB_REF_NAME" in rollback
+              and "CDN responses may remain cached temporarily" in rollback,
+              "failed public verification or promotion must remove the prerelease and tag with a cache warning",
+          )
+          require(
+              release.count("contents: write") == 3
+              and "contents: write" in prerelease
+              and "contents: write" in promote
+              and "contents: write" in rollback,
+              "write permission must be scoped to publication, promotion, and rollback",
+          )
+          require(
+              "[[ $(wc -l < SHA256SUMS) -eq 19 ]]" in job("assemble")
+              and "$manifestLines.Count -ne 19" in private_e2e
+              and "expected=(" in public_attestations,
+              "private and public gates must enforce the exact 19-payload manifest",
+          )
+          taiki_action = "uses: taiki-e/" + "install-action@"
+          no_fallback = "fallback:" + " none"
+          audit_tool = "tool: cargo-" + "audit@0.22.2"
+          require(
+              release.count(taiki_action) == 1
+              and release.count(no_fallback) == 1,
+              "release tool installation must use one explicit no-fallback action",
+          )
+          require(
+              ci.count(taiki_action) == 1
+              and audit_tool in ci
+              and ci.count(no_fallback) == 1,
+              "CI must install exact cargo-audit without fallback",
+          )
