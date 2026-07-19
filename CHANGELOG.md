@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `incant "query"` now translates directly and prints the command — no TUI popup gating the answer behind a second Enter. The interactive popup remains for bare `incant` (and Ctrl+K).
+- Cancelling the TUI (Escape/Ctrl+C) now exits with code 130 (SIGINT convention, as fzf does) instead of 0, so scripts can tell "dismissed" from "empty command".
+
+### Fixed
+
+- `incant "query"` no longer exits silently with status 0 and no output when stdin is not an interactive terminal. This surfaced right after daemon auto-start as three "Starting daemon…" lines and then nothing.
+- The TUI reads keystrokes from the controlling terminal (`/dev/tty`) instead of stdin, so redirected or closed stdin can no longer cancel the prompt. If no terminal is available, incant fails with a clear error instead of a silent flash. The `</dev/tty` redirection in the shell widgets keeps working but is no longer required.
+- The auto-started daemon is detached into its own session (`setsid`). Previously it shared the launching terminal's session and foreground process group, so Ctrl+C or closing that terminal silently killed it — forcing a cold "Starting daemon…" start in every new terminal and defeating the daemon's warm-latency purpose.
+- Removed a hard-coded 1-second sleep after daemon auto-start; readiness is already confirmed by the startup handshake.
+
 ## [0.2.0] - 2026-07-17
 
 ### Added

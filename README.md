@@ -65,8 +65,8 @@ incant --explain "find files modified in the last hour"
 
 ```bash
 incant                            # Interactive TUI popup
-incant "query"                    # TUI with pre-filled query
-incant --pipe "query"             # No TUI, direct stdout (for scripting)
+incant "query"                    # Direct: print the command (auto-starts daemon)
+incant --pipe "query"             # Script mode: like direct, but never auto-starts
 incant --explain "query"          # Also print a short explanation to stderr
 incant --fast "query"             # Use fast profile (smaller/faster model)
 incant --profile heavy "query"    # Use a named profile
