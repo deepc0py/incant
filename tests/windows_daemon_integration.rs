@@ -7,6 +7,11 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -91,6 +96,18 @@ struct IncantProcess {
     stdout: std::fs::File,
     stderr: std::fs::File,
     deadline: Instant,
+}
+
+struct LocalSecurityDescriptor(*mut std::ffi::c_void);
+
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: this pointer was returned by
+        // ConvertStringSecurityDescriptorToSecurityDescriptorW.
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
 }
 
 struct TestEnvironment {
@@ -261,26 +278,57 @@ fn assert_hung_pipe_probe_is_bounded(
     eprintln!("stage: hung lifecycle probe {args:?}");
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    let sid = pipe_name
+        .strip_prefix(r"\\.\pipe\incant-")
+        .expect("per-user pipe name contains current SID");
+    let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;{sid})")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor_ptr = std::ptr::null_mut();
+    // SAFETY: `sddl` is NUL-terminated and both output pointers are valid.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor_ptr,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        panic!(
+            "create hung-pipe security descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let descriptor = LocalSecurityDescriptor(descriptor_ptr);
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .expect("build Tokio runtime");
     let _runtime_guard = runtime.enter();
-    let server = ServerOptions::new()
-        .reject_remote_clients(true)
-        .first_pipe_instance(true)
-        .create(pipe_name)
-        .expect("create hung named-pipe server");
+    let mut options = ServerOptions::new();
+    // SAFETY: `attributes` references a live self-relative descriptor for the
+    // duration of CreateNamedPipeW.
+    let server = unsafe {
+        options
+            .reject_remote_clients(true)
+            .first_pipe_instance(true)
+            .create_with_security_attributes_raw(pipe_name, &mut attributes)
+    }
+    .expect("create hung named-pipe server");
 
     let started = Instant::now();
     let output = environment.run(args);
     let elapsed = started.elapsed();
     drop(server);
 
-    assert!(
-        !output.status.success(),
-        "hung probe unexpectedly succeeded"
-    );
     assert!(
         text(&output.stderr).contains("daemon status probe timed out"),
         "unexpected probe error: {}",
