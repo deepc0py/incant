@@ -6,6 +6,7 @@
 //! - Sends queries to the daemon via platform-native IPC
 //! - Outputs the generated command to stdout
 
+pub mod clipboard;
 pub mod socket;
 pub mod tui;
 

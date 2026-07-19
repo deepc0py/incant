@@ -55,3 +55,7 @@ verbose_flags = true
 # (rm -rf on broad paths, dd to devices, force-pushes, ...).
 # Advisory only: incant never executes or blocks commands.
 safety_warnings = true
+# Copy the generated command to the clipboard so it can be pasted.
+# Never applies to --pipe. Requires pbcopy (macOS), wl-copy/xclip
+# (Linux), or clip (Windows).
+clipboard = true
