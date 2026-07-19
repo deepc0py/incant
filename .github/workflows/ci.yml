@@ -64,7 +64,16 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo test --locked
+      - if: matrix.os != 'windows-latest'
+        run: cargo test --locked
+      - if: matrix.os == 'windows-latest'
+        name: Run Windows unit tests
+        run: cargo test --locked --bin incant
+        timeout-minutes: 5
+      - if: matrix.os == 'windows-latest'
+        name: Run Windows daemon integration
+        run: cargo test --locked --test windows_daemon_integration -- --nocapture --test-threads=1
+        timeout-minutes: 5
 
   audit:
     name: cargo audit

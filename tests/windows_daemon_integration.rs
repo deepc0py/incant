@@ -225,6 +225,7 @@ fn assert_hung_pipe_probe_is_bounded(
     pipe_name: &str,
     args: &[&str],
 ) {
+    eprintln!("stage: hung lifecycle probe {args:?}");
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -267,10 +268,12 @@ fn assert_hung_pipe_probe_is_bounded(
 #[test]
 fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
     let environment = TestEnvironment::new();
+    eprintln!("stage: detached start");
 
     let start = environment.assert_success(&["daemon", "start"]);
     assert!(text(&start.stderr).contains("Daemon is ready"));
 
+    eprintln!("stage: status and round trip");
     let status = environment.assert_success(&["daemon", "status"]);
     let status = text(&status.stdout);
     assert!(status.contains("Daemon: running"));
@@ -283,6 +286,7 @@ fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
     let query = environment.assert_success(&["--pipe", "list files"]);
     assert_eq!(text(&query.stdout), "echo windows");
 
+    eprintln!("stage: concurrent clients");
     let mut clients = Vec::new();
     for _ in 0..4 {
         let args = ["--pipe", "concurrent request"];
@@ -299,9 +303,11 @@ fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
         assert_eq!(text(&output.stdout), "echo windows");
     }
 
+    eprintln!("stage: detached stop");
     environment.assert_success(&["daemon", "stop"]);
     environment.wait_until_stopped();
 
+    eprintln!("stage: bounded hung lifecycle probes");
     // A live, correctly owned pipe that never answers Status must fail every
     // lifecycle command on one total deadline. Start must not treat the timeout
     // as absence and launch a duplicate daemon.
@@ -313,6 +319,7 @@ fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
         assert_hung_pipe_probe_is_bounded(&environment, &pipe_name, args);
     }
 
+    eprintln!("stage: stale state");
     // Stale filesystem state must not imply liveness on Windows; named pipes
     // themselves leave no filesystem entry to clean up.
     std::fs::write(environment.pid_path(), "4294967295").unwrap();
@@ -322,9 +329,11 @@ fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
     let unavailable = environment.run(&["--pipe", "must fail closed"]);
     assert!(!unavailable.status.success());
 
+    eprintln!("stage: restart after stale state");
     // A new detached start removes stale startup state and remains stoppable.
     environment.assert_success(&["daemon", "start"]);
     environment.assert_success(&["daemon", "stop"]);
     environment.wait_until_stopped();
     assert!(!environment.pid_path().exists());
+    eprintln!("stage: complete");
 }
