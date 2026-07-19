@@ -2,7 +2,7 @@
 
 //! Windows end-to-end coverage for detached lifecycle and secure named-pipe IPC.
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
@@ -86,6 +86,13 @@ fn serve_one(stream: &mut std::net::TcpStream, generate_body: &str) -> std::io::
     stream.flush()
 }
 
+struct IncantProcess {
+    child: Child,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+    deadline: Instant,
+}
+
 struct TestEnvironment {
     home: tempfile::TempDir,
     local_app_data: PathBuf,
@@ -132,20 +139,36 @@ impl TestEnvironment {
         command
     }
 
-    fn wait_for_output(&self, child: Child, args: &[&str]) -> Output {
-        wait_for_incant(child, args)
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
+    fn spawn(&self, args: &[&str]) -> IncantProcess {
+        let stdout = tempfile::tempfile().expect("create incant stdout capture");
+        let stderr = tempfile::tempfile().expect("create incant stderr capture");
         let mut command = self.command();
         command
             .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::from(
+                stdout.try_clone().expect("clone stdout capture"),
+            ))
+            .stderr(Stdio::from(
+                stderr.try_clone().expect("clone stderr capture"),
+            ));
         let child = command
             .spawn()
             .unwrap_or_else(|error| panic!("spawn incant {args:?}: {error}"));
-        self.wait_for_output(child, args)
+        IncantProcess {
+            child,
+            stdout,
+            stderr,
+            deadline: Instant::now() + PROCESS_TIMEOUT,
+        }
+    }
+
+    fn wait_for_output(&self, process: IncantProcess, args: &[&str]) -> Output {
+        wait_for_incant(process, args)
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        let process = self.spawn(args);
+        self.wait_for_output(process, args)
     }
 
     fn assert_success(&self, args: &[&str]) -> Output {
@@ -188,32 +211,42 @@ impl Drop for TestEnvironment {
     }
 }
 
-fn wait_for_incant(mut child: Child, args: &[&str]) -> Output {
-    let deadline = Instant::now() + PROCESS_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .unwrap_or_else(|error| panic!("reap incant {args:?}: {error}"));
-            }
-            Ok(None) if Instant::now() < deadline => {
+fn wait_for_incant(mut process: IncantProcess, args: &[&str]) -> Output {
+    let timed_out = loop {
+        match process.child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if Instant::now() < process.deadline => {
                 std::thread::sleep(Duration::from_millis(25));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let output = child
-                    .wait_with_output()
-                    .unwrap_or_else(|error| panic!("reap timed-out incant {args:?}: {error}"));
-                panic!(
-                    "incant {args:?} timed out after {PROCESS_TIMEOUT:?}\nstdout: {}\nstderr: {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                let _ = process.child.kill();
+                break true;
             }
             Err(error) => panic!("poll incant {args:?}: {error}"),
         }
-    }
+    };
+    let status = process
+        .child
+        .wait()
+        .unwrap_or_else(|error| panic!("reap incant {args:?}: {error}"));
+    let mut stdout = Vec::new();
+    process.stdout.seek(SeekFrom::Start(0)).unwrap();
+    process.stdout.read_to_end(&mut stdout).unwrap();
+    let mut stderr = Vec::new();
+    process.stderr.seek(SeekFrom::Start(0)).unwrap();
+    process.stderr.read_to_end(&mut stderr).unwrap();
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
+    assert!(
+        !timed_out,
+        "incant {args:?} timed out after {PROCESS_TIMEOUT:?}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -290,12 +323,7 @@ fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
     let mut clients = Vec::new();
     for _ in 0..4 {
         let args = ["--pipe", "concurrent request"];
-        let mut command = environment.command();
-        command
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        clients.push((command.spawn().expect("spawn concurrent client"), args));
+        clients.push((environment.spawn(&args), args));
     }
     for (client, args) in clients {
         let output = environment.wait_for_output(client, &args);
