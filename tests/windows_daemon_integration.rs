@@ -320,7 +320,10 @@ fn assert_hung_pipe_probe_is_bounded(
         options
             .reject_remote_clients(true)
             .first_pipe_instance(true)
-            .create_with_security_attributes_raw(pipe_name, &mut attributes)
+            .create_with_security_attributes_raw(
+                pipe_name,
+                &mut attributes as *mut _ as *mut std::ffi::c_void,
+            )
     }
     .expect("create hung named-pipe server");
 
