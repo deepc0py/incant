@@ -139,7 +139,7 @@ jobs:
 
       - name: Install Syft
         id: syft
-        uses: anchore/sbom-action/download-syft@b89c4df56be3261c31976d6725780e5e4c3737b # v0.24.0
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           syft-version: v1.48.0
 
@@ -258,9 +258,23 @@ jobs:
           body: |
             ## Windows support
 
-            Incant supports Windows 10 and Windows 11 on x64 and ARM64. PowerShell 7.4 or newer is required for the installer and PSReadLine integration.
+            Incant supports Windows 10 and Windows 11 on x64 and ARM64. No 32-bit Windows build is published. PowerShell 7.4 or newer is required for the installer and PSReadLine integration.
 
-            Download `install.ps1` and `SHA256SUMS`, verify the script's SHA-256 entry, then run:
+            Download the asset, `SHA256SUMS`, and `install.ps1`. Verify the installer's checksum:
+
+            ```powershell
+            $expected = ((Get-Content .\SHA256SUMS | Where-Object { $_ -match '  install\.ps1$' }) -split '  ')[0]
+            $actual = (Get-FileHash .\install.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $expected) { throw 'SHA-256 mismatch for install.ps1' }
+            ```
+
+            Verify the downloaded archive's build provenance:
+
+            ```text
+            gh attestation verify <asset> --repo deepc0py/incant
+            ```
+
+            Install the verified release:
 
             ```powershell
             pwsh -File .\install.ps1 -Version ${{ needs.validate-tag.outputs.version }}
@@ -384,7 +398,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = $env:GITHUB_REF_NAME -creplace '^v', ''
+          $version = $env:INCANT_RELEASE_VERSION
           $testRoot = Join-Path $env:RUNNER_TEMP 'incant-release-e2e'
           $env:LOCALAPPDATA = Join-Path $testRoot 'local-app-data'
           $installDir = Join-Path $env:LOCALAPPDATA 'Incant\bin'
@@ -393,6 +407,9 @@ jobs:
           $mockScript = Join-Path $testRoot 'mock-ollama.ps1'
           $mockStdout = Join-Path $testRoot 'mock-ollama.stdout'
           $mockStderr = Join-Path $testRoot 'mock-ollama.stderr'
+          $configPath = Join-Path $configDir 'config.toml'
+          $profileStartMarker = '# >>> incant PSReadLine integration >>>'
+          $profileEndMarker = '# <<< incant PSReadLine integration <<<'
           New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
 
           @'
@@ -451,6 +468,8 @@ jobs:
           '@ | Set-Content -LiteralPath $mockScript -Encoding utf8
 
           $mock = $null
+          $installAttempted = $false
+          $uninstallCompleted = $false
           $incant = Join-Path $installDir 'incant.exe'
           function Invoke-IncantBounded {
               param(
@@ -481,12 +500,22 @@ jobs:
           }
 
           try {
+              $installAttempted = $true
               & ./dist/install.ps1 -Version $version `
                   -InstallDir $installDir `
                   -ConfigDir $configDir `
                   -ProfilePath $profilePath
               if ($LASTEXITCODE -notin @(0, $null)) {
                   throw "Published install.ps1 failed with status $LASTEXITCODE."
+              }
+              if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+                  throw 'Published installer did not create config.toml.'
+              }
+              $configHashBefore = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+              $installedProfile = Get-Content -LiteralPath $profilePath -Raw
+              if (-not $installedProfile.Contains($profileStartMarker) -or
+                  -not $installedProfile.Contains($profileEndMarker)) {
+                  throw 'Published installer did not create the owned PowerShell profile block.'
               }
 
               $versionResult = Invoke-IncantBounded -Arguments @('--version')
@@ -523,7 +552,9 @@ jobs:
                   throw "daemon start failed: $($start.Stdout) $($start.Stderr)"
               }
               $status = Invoke-IncantBounded -Arguments @('daemon', 'status')
-              if ($status.ExitCode -ne 0 -or $status.Stdout -cne 'Daemon is running') {
+              $statusLines = @($status.Stdout -split '\r?\n')
+              if ($status.ExitCode -ne 0 -or $statusLines.Count -lt 1 -or
+                  $statusLines[0] -cne 'Daemon: running') {
                   throw "daemon status failed: $($status.Stdout) $($status.Stderr)"
               }
               $query = Invoke-IncantBounded -Arguments @('release-e2e-query')
@@ -534,13 +565,100 @@ jobs:
               if ($stop.ExitCode -ne 0 -or $stop.Stdout -cne 'Daemon stopped') {
                   throw "daemon stop failed: $($stop.Stdout) $($stop.Stderr)"
               }
+              $stoppedStatus = Invoke-IncantBounded -Arguments @('daemon', 'status')
+              $stoppedStatusLines = @($stoppedStatus.Stdout -split '\r?\n')
+              if ($stoppedStatus.ExitCode -ne 0 -or
+                  $stoppedStatusLines.Count -ne 2 -or
+                  $stoppedStatusLines[0] -cne 'Daemon: not running' -or
+                  $stoppedStatusLines[1] -cne 'Start with: incant daemon start') {
+                  throw "daemon status after stop was not exact: $($stoppedStatus | ConvertTo-Json -Compress)"
+              }
+
+              & ./dist/install.ps1 -Uninstall `
+                  -InstallDir $installDir `
+                  -ConfigDir $configDir `
+                  -ProfilePath $profilePath
+              if ($LASTEXITCODE -notin @(0, $null)) {
+                  throw "Published install.ps1 -Uninstall failed with status $LASTEXITCODE."
+              }
+              if (Test-Path -LiteralPath $incant) {
+                  throw 'Published uninstaller left incant.exe installed.'
+              }
+              $uninstalledProfile = if (Test-Path -LiteralPath $profilePath) {
+                  Get-Content -LiteralPath $profilePath -Raw
+              }
+              else {
+                  ''
+              }
+              if ($uninstalledProfile.Contains($profileStartMarker) -or
+                  $uninstalledProfile.Contains($profileEndMarker)) {
+                  throw 'Published uninstaller left the owned PowerShell profile block installed.'
+              }
+              if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+                  throw 'Published uninstaller removed config.toml without -RemoveConfig.'
+              }
+              $configHashAfter = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+              if ($configHashAfter -cne $configHashBefore) {
+                  throw 'Published uninstaller modified config.toml.'
+              }
+              $uninstallCompleted = $true
           }
           finally {
-              if (Test-Path -LiteralPath $incant) {
-                  Invoke-IncantBounded -Arguments @('daemon', 'stop') -TimeoutSeconds 10 | Out-Null
+              $cleanupFailures = [Collections.Generic.List[string]]::new()
+              if ($installAttempted -and -not $uninstallCompleted) {
+                  try {
+                      if (Test-Path -LiteralPath $incant) {
+                          $cleanupStop = Invoke-IncantBounded -Arguments @('daemon', 'stop') -TimeoutSeconds 10
+                          if ($cleanupStop.ExitCode -ne 0 -or
+                              $cleanupStop.Stdout -notin @('Daemon stopped', 'Daemon is not running')) {
+                              throw "cleanup daemon stop failed: $($cleanupStop | ConvertTo-Json -Compress)"
+                          }
+                      }
+                      & ./dist/install.ps1 -Uninstall `
+                          -InstallDir $installDir `
+                          -ConfigDir $configDir `
+                          -ProfilePath $profilePath
+                      if ($LASTEXITCODE -notin @(0, $null)) {
+                          throw "cleanup uninstall failed with status $LASTEXITCODE."
+                      }
+                      if (Test-Path -LiteralPath $incant) {
+                          throw 'cleanup uninstall left incant.exe installed.'
+                      }
+                      $cleanupProfile = if (Test-Path -LiteralPath $profilePath) {
+                          Get-Content -LiteralPath $profilePath -Raw
+                      }
+                      else {
+                          ''
+                      }
+                      if ($cleanupProfile.Contains($profileStartMarker) -or
+                          $cleanupProfile.Contains($profileEndMarker)) {
+                          throw 'cleanup uninstall left the owned PowerShell profile block installed.'
+                      }
+                  }
+                  catch {
+                      $cleanupFailures.Add($_.Exception.Message)
+                  }
               }
               if ($null -ne $mock -and -not $mock.HasExited) {
-                  Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue
+                  try {
+                      Stop-Process -Id $mock.Id -Force -ErrorAction Stop
+                      if (-not $mock.WaitForExit(5000)) {
+                          throw 'mock Ollama did not exit within 5 seconds.'
+                      }
+                  }
+                  catch {
+                      $cleanupFailures.Add("mock Ollama cleanup failed: $($_.Exception.Message)")
+                  }
               }
-              Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+              try {
+                  if (Test-Path -LiteralPath $testRoot) {
+                      Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction Stop
+                  }
+              }
+              catch {
+                  $cleanupFailures.Add("temporary owned-state cleanup failed: $($_.Exception.Message)")
+              }
+              if ($cleanupFailures.Count -ne 0) {
+                  throw "Release E2E cleanup failed: $($cleanupFailures -join '; ')"
+              }
           }
