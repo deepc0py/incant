@@ -1,32 +1,31 @@
-//! Unix socket server for the daemon.
+//! Platform-native IPC server for the daemon.
 //!
 //! Handles client connections and routes requests to the LLM backend.
 
 use crate::config::Config;
 use crate::daemon::llm::{create_backend, Backend};
 use crate::protocol::{framing, Message, Response};
+use crate::transport::{self, Endpoint, Listener, ServerStream};
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info};
 
 /// The daemon server that listens for client connections.
 pub struct DaemonServer {
     config: Config,
-    socket_path: PathBuf,
+    endpoint: Endpoint,
     backend: Arc<Backend>,
 }
 
 impl DaemonServer {
     /// Create a new daemon server.
     pub fn new(config: Config) -> Result<Self> {
-        let socket_path = Config::socket_path()?;
+        let endpoint = transport::endpoint()?;
         let backend = create_backend(&config);
 
         Ok(Self {
             config,
-            socket_path,
+            endpoint,
             backend: Arc::new(backend),
         })
     }
@@ -46,28 +45,6 @@ impl DaemonServer {
 
     /// Inner run logic that can fail during startup.
     async fn run_inner(&self) -> Result<()> {
-        // Ensure the runtime directory exists and is private. XDG_RUNTIME_DIR
-        // is 0700 per spec; the ~/.local/run fallback is created (or
-        // tightened) to 0700 so no other local user can reach the socket,
-        // even during the window between bind() and chmod below.
-        if let Some(parent) = self.socket_path.parent() {
-            ensure_private_dir(parent).with_context(|| {
-                format!("Failed to secure socket directory: {}", parent.display())
-            })?;
-        }
-
-        // Remove existing socket file
-        if self.socket_path.exists() {
-            tokio::fs::remove_file(&self.socket_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to remove existing socket: {}",
-                        self.socket_path.display()
-                    )
-                })?;
-        }
-
         // Perform health check
         info!("Checking backend health...");
         self.backend.health_check().await.with_context(|| {
@@ -83,19 +60,9 @@ impl DaemonServer {
             self.backend.model()
         );
 
-        // Bind to the socket, then restrict it to the owning user. The
-        // private parent directory above already blocks access during the
-        // bind-to-chmod window; this is defense in depth.
-        let listener = UnixListener::bind(&self.socket_path)
-            .with_context(|| format!("Failed to bind to socket: {}", self.socket_path.display()))?;
-        restrict_to_owner(&self.socket_path).with_context(|| {
-            format!(
-                "Failed to restrict socket permissions: {}",
-                self.socket_path.display()
-            )
-        })?;
+        let mut listener = Listener::bind(&self.endpoint)?;
 
-        info!("Daemon listening on {}", self.socket_path.display());
+        info!("Daemon listening on {}", self.endpoint);
 
         // Write PID file
         self.write_pid_file().await?;
@@ -106,7 +73,7 @@ impl DaemonServer {
         // Accept connections
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
+                Ok(stream) => {
                     let backend = Arc::clone(&self.backend);
                     let config = self.config.clone();
                     tokio::spawn(async move {
@@ -125,11 +92,7 @@ impl DaemonServer {
     /// Write the PID file.
     async fn write_pid_file(&self) -> Result<()> {
         let pid_path = Config::pid_path()?;
-        if let Some(parent) = pid_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let pid = std::process::id();
-        tokio::fs::write(&pid_path, pid.to_string()).await?;
+        crate::transport::write_private_file(&pid_path, std::process::id().to_string().as_bytes())?;
         info!("PID file written to {}", pid_path.display());
         Ok(())
     }
@@ -137,23 +100,20 @@ impl DaemonServer {
     /// Write startup status to a file for parent process to read.
     async fn write_startup_status(status: &str) -> Result<()> {
         let status_path = Config::startup_status_path()?;
-        if let Some(parent) = status_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&status_path, status).await?;
+        crate::transport::write_private_file(&status_path, status.as_bytes())?;
         Ok(())
     }
 
-    /// Get the socket path.
+    /// Get the daemon endpoint.
     #[allow(dead_code)]
-    pub fn socket_path(&self) -> &PathBuf {
-        &self.socket_path
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
     }
 }
 
 /// Handle a single client connection.
 async fn handle_client(
-    mut stream: UnixStream,
+    mut stream: ServerStream,
     backend: Arc<Backend>,
     config: Config,
 ) -> Result<()> {
@@ -226,9 +186,9 @@ async fn handle_client(
         }
         Message::Shutdown => {
             info!("Received shutdown request");
-            // Clean up and exit
-            if let Ok(socket_path) = Config::socket_path() {
-                let _ = tokio::fs::remove_file(&socket_path).await;
+            // Named pipes need no cleanup; Unix removes its socket file.
+            if let Ok(endpoint) = transport::endpoint() {
+                let _ = transport::cleanup(&endpoint).await;
             }
             if let Ok(pid_path) = Config::pid_path() {
                 let _ = tokio::fs::remove_file(&pid_path).await;
@@ -265,35 +225,48 @@ async fn explain_command(
         .await
 }
 
-/// Check if the daemon is running.
-pub async fn is_daemon_running() -> bool {
-    if let Ok(socket_path) = Config::socket_path() {
-        if socket_path.exists() {
-            // Try to connect
-            if let Ok(mut stream) = UnixStream::connect(&socket_path).await {
-                // Send a status request
-                if framing::write_message(&mut stream, &Message::Status)
-                    .await
-                    .is_ok()
-                {
-                    if let Ok(_response) = framing::read_message::<_, Response>(&mut stream).await {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
+/// Probe whether the daemon is running.
+///
+/// A missing/refused endpoint is the normal not-running state. Every other
+/// transport failure is reported, and the entire connect/write/read exchange
+/// has one deadline so a wedged same-user server cannot hang lifecycle commands.
+pub async fn probe_daemon_status() -> Result<bool> {
+    const STATUS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let endpoint = transport::endpoint()?;
+    let probe = async {
+        let mut stream = match transport::connect(&endpoint).await {
+            Ok(stream) => stream,
+            Err(error) if endpoint_is_absent(&error) => return Ok(false),
+            Err(error) => return Err(error).context("daemon status probe failed"),
+        };
+        framing::write_message(&mut stream, &Message::Status)
+            .await
+            .context("daemon status probe failed")?;
+        let _: Response = framing::read_message(&mut stream)
+            .await
+            .context("daemon status probe failed")?;
+        Ok(true)
+    };
+
+    tokio::time::timeout(STATUS_PROBE_TIMEOUT, probe)
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon status probe timed out"))?
+}
+
+fn endpoint_is_absent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        )
+    })
 }
 
 /// Stop the running daemon.
 pub async fn stop_daemon() -> Result<()> {
-    let socket_path = Config::socket_path()?;
-    if !socket_path.exists() {
-        return Err(anyhow::anyhow!("Daemon is not running"));
-    }
-
-    let mut stream = UnixStream::connect(&socket_path)
+    let endpoint = transport::endpoint()?;
+    let mut stream = transport::connect(&endpoint)
         .await
         .context("Failed to connect to daemon")?;
 
@@ -306,80 +279,14 @@ pub async fn stop_daemon() -> Result<()> {
 /// Get the daemon's PID if running.
 pub async fn get_daemon_pid() -> Option<u32> {
     if let Ok(pid_path) = Config::pid_path() {
+        #[cfg(windows)]
+        {
+            crate::transport::ensure_private_directory(pid_path.parent()?).ok()?;
+            crate::transport::secure_existing_file(&pid_path).ok()?;
+        }
         if let Ok(contents) = tokio::fs::read_to_string(&pid_path).await {
             return contents.trim().parse().ok();
         }
     }
     None
-}
-
-/// Create `dir` if needed and ensure it is accessible only by its owner
-/// (mode 0700). Applies to pre-existing directories too, so a loose
-/// `~/.local/run` from an earlier install gets tightened.
-fn ensure_private_dir(dir: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-            info!("Tightened permissions on {} to 0700", dir.display());
-        }
-    }
-    Ok(())
-}
-
-/// Restrict a filesystem entry (the daemon socket) to owner read/write.
-fn restrict_to_owner(path: &std::path::Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    fn mode_of(path: &std::path::Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn ensure_private_dir_creates_with_0700() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        ensure_private_dir(&dir).unwrap();
-        assert_eq!(mode_of(&dir), 0o700);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn ensure_private_dir_tightens_existing_loose_dir() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        ensure_private_dir(&dir).unwrap();
-        assert_eq!(mode_of(&dir), 0o700);
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn bound_socket_is_owner_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("t.sock");
-        let _listener = tokio::net::UnixListener::bind(&sock).unwrap();
-        restrict_to_owner(&sock).unwrap();
-        assert_eq!(mode_of(&sock), 0o600);
-    }
 }

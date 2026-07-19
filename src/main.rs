@@ -9,6 +9,7 @@ mod context;
 mod daemon;
 mod protocol;
 mod safety;
+mod transport;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -141,7 +142,7 @@ async fn handle_daemon(action: DaemonAction) -> Result<()> {
 /// Note: All output goes to stderr to avoid polluting stdout (which may be captured by shell).
 async fn start_daemon() -> Result<()> {
     // Check if already running
-    if daemon::server::is_daemon_running().await {
+    if daemon::server::probe_daemon_status().await? {
         eprintln!("Daemon is already running");
         return Ok(());
     }
@@ -153,14 +154,19 @@ async fn start_daemon() -> Result<()> {
     // Get the current executable path
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
 
-    // Spawn the daemon process
-    let child = ProcessCommand::new(&exe)
+    let mut command = ProcessCommand::new(&exe);
+    command
         .args(["daemon", "run"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("Failed to start daemon process")?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    let child = command.spawn().context("Failed to start daemon process")?;
 
     let pid = child.id();
     eprintln!("Starting daemon (PID {})...", pid);
@@ -190,7 +196,7 @@ async fn start_daemon() -> Result<()> {
 
         // Also check if process is still alive
         // If socket exists and responds, we're good
-        if daemon::server::is_daemon_running().await {
+        if daemon::server::probe_daemon_status().await? {
             eprintln!("Daemon is ready");
             return Ok(());
         }
@@ -212,7 +218,7 @@ async fn start_daemon() -> Result<()> {
 
 /// Stop the running daemon.
 async fn stop_daemon() -> Result<()> {
-    if !daemon::server::is_daemon_running().await {
+    if !daemon::server::probe_daemon_status().await? {
         println!("Daemon is not running");
         return Ok(());
     }
@@ -224,7 +230,7 @@ async fn stop_daemon() -> Result<()> {
 
 /// Show daemon status.
 async fn daemon_status() -> Result<()> {
-    if daemon::server::is_daemon_running().await {
+    if daemon::server::probe_daemon_status().await? {
         let config = config::Config::load()?;
         let pid = daemon::server::get_daemon_pid().await;
 
@@ -235,7 +241,7 @@ async fn daemon_status() -> Result<()> {
         println!("Backend: {}", config.backend_type());
         println!("Default model: {}", config.model_name());
         println!("Default profile: {}", config.default_profile());
-        println!("Socket: {}", config::Config::socket_path()?.display());
+        println!("Endpoint: {}", transport::endpoint()?);
     } else {
         println!("Daemon: not running");
         println!("Start with: incant daemon start");
@@ -471,9 +477,17 @@ async fn remove_model(host: &str, model: &str) -> Result<()> {
 fn handle_config() -> Result<()> {
     let config_path = config::Config::config_path()?;
 
-    // Ensure config directory exists
+    // Ensure an existing config boundary is private before invoking an editor.
+    #[cfg(unix)]
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(windows)]
+    if let Some(parent) = config_path.parent() {
+        transport::ensure_private_directory(parent)?;
+        if config_path.exists() {
+            transport::secure_existing_file(&config_path)?;
+        }
     }
 
     // Create default config if it doesn't exist
@@ -597,7 +611,7 @@ async fn handle_query(
     let resolved_temperature = model_selection.resolve_temperature(&config);
 
     // Ensure daemon is running, try to auto-start if not
-    if !daemon::server::is_daemon_running().await {
+    if !daemon::server::probe_daemon_status().await? {
         if pipe_mode {
             eprintln!("Daemon not running. Start with: incant daemon start");
             std::process::exit(1);
@@ -610,7 +624,7 @@ async fn handle_query(
         // Give it time to start
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-        if !daemon::server::is_daemon_running().await {
+        if !daemon::server::probe_daemon_status().await? {
             eprintln!("Failed to start daemon. Check your configuration.");
             std::process::exit(1);
         }

@@ -1,6 +1,6 @@
 //! IPC protocol definitions for client-daemon communication.
 //!
-//! The protocol uses JSON over Unix domain sockets for simplicity and debuggability.
+//! The protocol uses length-prefixed JSON over the platform-native IPC stream.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

@@ -1,11 +1,10 @@
-//! Unix socket client for communicating with the daemon.
+//! Platform-native client for communicating with the daemon.
 
-use crate::config::Config;
 use crate::protocol::{framing, Context, Message, Request, Response};
 use crate::safety::Assessment;
+use crate::transport::{self, ClientStream};
 use anyhow::{Context as AnyhowContext, Result};
 use std::time::Duration;
-use tokio::net::UnixStream;
 
 /// A generated command together with the daemon's advisory risk assessment
 /// and optional explanation.
@@ -23,17 +22,15 @@ pub async fn send_query(
     temperature: Option<f32>,
     explain: bool,
 ) -> Result<GeneratedCommand> {
-    let socket_path = Config::socket_path()?;
+    let endpoint = transport::endpoint()?;
 
-    // Connect with timeout
-    let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(&socket_path))
+    // Windows validates the pipe owner's SID inside connect(), before this
+    // function can send any context or prompt data.
+    let stream = tokio::time::timeout(Duration::from_secs(5), transport::connect(&endpoint))
         .await
         .map_err(|_| anyhow::anyhow!("Connection timeout - is the daemon running?"))?
         .with_context(|| {
-            format!(
-                "Failed to connect to daemon at {}. Start it with: incant daemon start",
-                socket_path.display()
-            )
+            format!("Failed to connect to daemon at {endpoint}. Start it with: incant daemon start")
         })?;
 
     send_query_to_stream(stream, query, context, model, temperature, explain).await
@@ -41,7 +38,7 @@ pub async fn send_query(
 
 /// Send a query to an existing stream.
 async fn send_query_to_stream(
-    mut stream: UnixStream,
+    mut stream: ClientStream,
     query: String,
     context: Context,
     model: Option<String>,
@@ -85,19 +82,11 @@ async fn send_query_to_stream(
 /// Check if the daemon is reachable.
 #[allow(dead_code)]
 pub async fn check_daemon() -> Result<()> {
-    let socket_path = Config::socket_path()?;
+    let endpoint = transport::endpoint()?;
 
-    if !socket_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Daemon socket not found at {}. Start daemon with: incant daemon start",
-            socket_path.display()
-        ));
-    }
-
-    let mut stream =
-        tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(&socket_path))
-            .await
-            .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+    let mut stream = tokio::time::timeout(Duration::from_secs(2), transport::connect(&endpoint))
+        .await
+        .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
 
     // Send status request
     framing::write_message(&mut stream, &Message::Status).await?;

@@ -3,7 +3,7 @@
 //! The client is a lightweight process that:
 //! - Renders a minimal TUI input prompt
 //! - Gathers terminal context
-//! - Sends queries to the daemon via Unix socket
+//! - Sends queries to the daemon via platform-native IPC
 //! - Outputs the generated command to stdout
 
 pub mod socket;

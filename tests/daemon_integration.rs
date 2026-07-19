@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! End-to-end integration tests: the real `incant` binary, a real Unix
 //! socket, and a mock Ollama HTTP server. No network access.
 //!
