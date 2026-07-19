@@ -101,18 +101,40 @@ impl Rule {
             segment_scoped,
         }
     }
+    fn specialized_match(
+        &self,
+        source: &PowerShellSource<'_>,
+        operation_start: usize,
+    ) -> Option<bool> {
+        let launcher_start = || {
+            powershell_launcher_start(source, operation_start)
+                .map(|(launcher_start, _)| launcher_start)
+        };
+        match self.id {
+            "powershell-encoded-command" => Some(
+                launcher_start()
+                    .is_some_and(|start| matches_encoded_powershell_command(source, start)),
+            ),
+            "powershell-execution-policy-bypass" => Some(
+                launcher_start()
+                    .is_some_and(|start| matches_execution_policy_bypass(source, start)),
+            ),
+            _ => None,
+        }
+    }
 
     fn matches(&self, command: &str, sources: &[PowerShellSource<'_>]) -> bool {
         if !self.segment_scoped {
             return self.all.iter().all(|re| re.is_match(command))
                 && self.unless.as_ref().is_none_or(|re| !re.is_match(command));
         }
-        if self.id == "powershell-encoded-command" {
-            return sources.iter().any(matches_encoded_powershell_command);
-        }
 
         sources.iter().any(|source| {
             source.lex.command_starts.iter().any(|&original_start| {
+                if let Some(specialized) = self.specialized_match(source, original_start) {
+                    return specialized;
+                }
+
                 let start = source.normalized_boundary(original_start);
                 let untrimmed = &source.normalized[start..];
                 let candidate = untrimmed.trim_start_matches(char::is_whitespace);
@@ -139,6 +161,13 @@ impl Rule {
                     else {
                         return false;
                     };
+                    if powershell_operation_is_inert_assignment(
+                        source.text,
+                        &source.lex,
+                        operation_start,
+                    ) {
+                        return false;
+                    }
                     let invocation_end = source.lex.invocation_end(source.text, operation_start);
                     let normalized_operation = source.normalized_boundary(operation_start);
                     let normalized_invocation_end = source.normalized_boundary(invocation_end);
@@ -151,15 +180,18 @@ impl Rule {
                                 let start = normalized_operation + exception.start();
                                 let end = normalized_operation + exception.end();
                                 source.original_range(start, end).is_some_and(
-                                    |(original_start, original_end)| {
+                                    |(exception_start, exception_end)| {
                                         source
                                             .lex
                                             .operation_start(
                                                 source.text,
-                                                original_start,
-                                                original_end,
+                                                exception_start,
+                                                exception_end,
                                             )
-                                            .is_some()
+                                            .is_some_and(|exception_operation| {
+                                                source.lex.bytes[exception_operation].nesting
+                                                    == source.lex.bytes[operation_start].nesting
+                                            })
                                     },
                                 )
                             })
@@ -168,6 +200,30 @@ impl Rule {
             })
         })
     }
+}
+
+fn powershell_operation_is_inert_assignment(
+    command: &str,
+    lex: &PowerShellLex,
+    operation_start: usize,
+) -> bool {
+    let raw = command.as_bytes();
+    let mut closed_braces = 0_u16;
+    for index in (0..operation_start).rev() {
+        if !lex.bytes[index].executable {
+            continue;
+        }
+        match raw[index] {
+            b'}' => closed_braces += 1,
+            b'{' if closed_braces > 0 => closed_braces -= 1,
+            b'{' => {
+                return previous_executable_non_whitespace(command, &lex.bytes, index)
+                    == Some(b'=');
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -432,7 +488,19 @@ fn normalize_powershell_executable(command: &str, lex: &PowerShellLex) -> (Strin
         if value == b'`' && lex.bytes.get(index + 1).is_some_and(|next| next.escaped) {
             continue;
         }
-        if byte.escaped && matches!(value, b'\r' | b'\n') {
+        if byte.escaped {
+            if matches!(value, b'\r' | b'\n') {
+                continue;
+            }
+            if value.is_ascii_whitespace()
+                || matches!(value, b';' | b'&' | b'|' | b'{' | b'}' | b'(' | b')')
+            {
+                normalized.push(b'_');
+                offsets.push(index);
+                continue;
+            }
+        }
+        if byte.invocation_quoted && matches!(value, b'\'' | b'"') {
             continue;
         }
         normalized.push(value);
@@ -559,11 +627,13 @@ enum PowerShellLauncherParameter {
     Command,
     CommandWithArgs,
     EncodedCommand,
+    ExecutionPolicy,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PowerShellLauncherOption {
     parameter: PowerShellLauncherParameter,
+    operation_start: usize,
     argument_start: usize,
     invocation_end: usize,
 }
@@ -645,6 +715,7 @@ fn powershell_launcher_options(source: &PowerShellSource<'_>) -> Vec<PowerShellL
             if argument_start < invocation_end {
                 options.push(PowerShellLauncherOption {
                     parameter,
+                    operation_start,
                     argument_start,
                     invocation_end,
                 });
@@ -730,63 +801,64 @@ fn skip_powershell_whitespace(command: &str, mut cursor: usize, limit: usize) ->
 }
 
 fn resolve_powershell_launcher_parameter(value: &str) -> Option<PowerShellLauncherParameter> {
-    if value.eq_ignore_ascii_case("c") {
+    let value = value.to_ascii_lowercase();
+    if value == "c" || (value.len() >= 2 && "command".starts_with(&value)) {
         return Some(PowerShellLauncherParameter::Command);
     }
-    if value.eq_ignore_ascii_case("cwa") {
+    if value == "cwa" || value == "commandwithargs" {
         return Some(PowerShellLauncherParameter::CommandWithArgs);
     }
-    if ["e", "ec", "enc"]
-        .iter()
-        .any(|alias| value.eq_ignore_ascii_case(alias))
+    if value == "e"
+        || value == "ec"
+        || (value.len() >= "en".len() && "encodedcommand".starts_with(&value))
     {
         return Some(PowerShellLauncherParameter::EncodedCommand);
     }
-
-    const PARAMETERS: &[&str] = &[
-        "command",
-        "configurationfile",
-        "custompipename",
-        "encodedcommand",
-        "executionpolicy",
-        "file",
-        "help",
-        "inputformat",
-        "interactive",
-        "login",
-        "mta",
-        "noexit",
-        "nologo",
-        "noninteractive",
-        "noprofile",
-        "noprofileloadtime",
-        "outputformat",
-        "settingsfile",
-        "sshservermode",
-        "sta",
-        "version",
-        "windowstyle",
-        "workingdirectory",
-    ];
-    let value = value.to_ascii_lowercase();
-    let mut matches = PARAMETERS
-        .iter()
-        .copied()
-        .filter(|parameter| parameter.starts_with(&value));
-    let parameter = matches.next()?;
-    if matches.next().is_some() {
-        return None;
+    if value == "ep" || (value.len() >= "ex".len() && "executionpolicy".starts_with(&value)) {
+        return Some(PowerShellLauncherParameter::ExecutionPolicy);
     }
-    match parameter {
-        "command" => Some(PowerShellLauncherParameter::Command),
-        "encodedcommand" => Some(PowerShellLauncherParameter::EncodedCommand),
-        _ => None,
-    }
+    None
 }
-fn matches_encoded_powershell_command(source: &PowerShellSource<'_>) -> bool {
-    powershell_launcher_options(source)
-        .iter()
-        .any(|option| option.parameter == PowerShellLauncherParameter::EncodedCommand)
+fn matches_encoded_powershell_command(
+    source: &PowerShellSource<'_>,
+    operation_start: usize,
+) -> bool {
+    powershell_launcher_options(source).iter().any(|option| {
+        option.operation_start == operation_start
+            && option.parameter == PowerShellLauncherParameter::EncodedCommand
+    })
+}
+
+fn matches_execution_policy_bypass(source: &PowerShellSource<'_>, operation_start: usize) -> bool {
+    powershell_launcher_options(source).iter().any(|option| {
+        option.operation_start == operation_start
+            && option.parameter == PowerShellLauncherParameter::ExecutionPolicy
+            && powershell_launcher_argument(
+                source.text,
+                option.argument_start,
+                option.invocation_end,
+            )
+            .is_some_and(|argument| {
+                argument.eq_ignore_ascii_case("bypass")
+                    || argument.eq_ignore_ascii_case("unrestricted")
+            })
+    })
+}
+
+fn powershell_launcher_argument(
+    command: &str,
+    argument_start: usize,
+    invocation_end: usize,
+) -> Option<&str> {
+    let raw = command.as_bytes();
+    if matches!(raw.get(argument_start), Some(b'\'' | b'"')) {
+        let end = powershell_quote_end(command, argument_start)?;
+        return (end <= invocation_end).then_some(&command[argument_start + 1..end]);
+    }
+    let end = command[argument_start..invocation_end]
+        .find(char::is_whitespace)
+        .map_or(invocation_end, |offset| argument_start + offset);
+    Some(&command[argument_start..end])
 }
 
 fn powershell_quote_end(command: &str, quote_start: usize) -> Option<usize> {
@@ -864,8 +936,29 @@ fn expandable_string_subexpressions(command: &str) -> Vec<&str> {
             Some(_) => unreachable!("only PowerShell quote bytes are stored"),
             None => {
                 if let Some(delimiter) = powershell_here_string_opener(raw, index) {
-                    index = powershell_here_string_end(raw, index + 2, delimiter)
-                        .map_or(raw.len(), |terminator| terminator + 2);
+                    let terminator = powershell_here_string_end(raw, index + 2, delimiter);
+                    if delimiter == b'"' {
+                        let limit = terminator.unwrap_or(raw.len());
+                        let mut cursor = index + 2;
+                        while cursor < limit {
+                            if raw[cursor] == b'`' && cursor + 1 < limit {
+                                cursor += 2;
+                                continue;
+                            }
+                            if raw[cursor] == b'$' && raw.get(cursor + 1) == Some(&b'(') {
+                                if let Some(end) = powershell_subexpression_end(command, cursor + 1)
+                                {
+                                    if end <= limit {
+                                        payloads.push(&command[cursor + 2..end]);
+                                        cursor = end + 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            cursor += 1;
+                        }
+                    }
+                    index = terminator.map_or(raw.len(), |end| end + 2);
                     continue;
                 }
                 if raw[index] == b'<' && raw.get(index + 1) == Some(&b'#') {
@@ -1079,7 +1172,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "windows-registry-native-change",
             RiskLevel::Destructive,
             "changes or removes Windows registry keys or values",
-            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*)?reg(?:\.exe)?\s+(?:add|delete|import|restore|load|unload)\b"],
+            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*(?:[^|;\r\n]*[\\/])?)?reg(?:\.exe)?\s+(?:add|delete|import|restore|load|unload)\b"],
             None,
         ),
         Rule::new(
@@ -1100,14 +1193,14 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "windows-schtasks-change",
             RiskLevel::Destructive,
             "creates, deletes, or changes a Windows scheduled task",
-            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*)?schtasks(?:\.exe)?\b[^|;\r\n]*/(?:create|delete|change)\b"],
+            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*(?:[^|;\r\n]*[\\/])?)?schtasks(?:\.exe)?\b[^|;\r\n]*/(?:create|delete|change)\b"],
             None,
         ),
         Rule::new(
             "windows-service-native-change",
             RiskLevel::Destructive,
             "changes, stops, or removes a Windows service",
-            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*)?sc\.exe\s+(?:stop|delete|config|failure|failureflag)\b"],
+            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*(?:[^|;\r\n]*[\\/])?)?sc\.exe\s+(?:stop|delete|config|failure|failureflag)\b"],
             None,
         ),
         Rule::new(
@@ -1128,7 +1221,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "powershell-storage-change",
             RiskLevel::Destructive,
             "initializes, formats, clears, resizes, or repartitions storage",
-            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:clear-disk|initialize-disk|format-volume|new-partition|remove-partition|resize-partition|set-disk)\b['"]?"#],
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:clear-disk|initialize-disk|format-volume|new-partition|remove-partition|resize-partition|set-partition|set-disk)\b['"]?"#],
             Some(POWERSHELL_WHAT_IF),
         ),
         Rule::new(
@@ -1170,7 +1263,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "windows-event-log-native-clear",
             RiskLevel::Destructive,
             "clears a Windows event log",
-            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*)?wevtutil(?:\.exe)?\s+(?:cl|clear-log)\b"],
+            &[r"(?i)(?:^|[|;{(]\s*)(?:&\s*(?:[^|;\r\n]*[\\/])?)?wevtutil(?:\.exe)?\s+(?:cl|clear-log)\b"],
             None,
         ),
         Rule::new(
@@ -1325,7 +1418,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "powershell-runas",
             RiskLevel::Caution,
             "requests an elevated process through Start-Process -Verb RunAs",
-            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?start-process\b['"]?[^|;\r\n]*-verb\s+['"]?runas\b"#],
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:start-process|saps)\b['"]?[^|;\r\n]*-verb\s+['"]?runas\b"#],
             None,
         ),
     ]
@@ -2242,8 +2335,12 @@ mod tests {
             assert_flags(command, "powershell-service-change", RiskLevel::Destructive);
         }
 
-        for command in [
+        assert_flags(
             "pwsh -Co Stop-Service Spooler",
+            "powershell-service-change",
+            RiskLevel::Destructive,
+        );
+        for command in [
             "pwsh -CommandText Stop-Service Spooler",
             "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Com 'Stop-Service Spooler'",
             "& 'C:\\Tools\\not-pwsh.exe' -Com 'Stop-Service Spooler'",
@@ -2275,7 +2372,23 @@ mod tests {
 
     #[test]
     fn encoded_command_accepts_only_powershell_parameter_prefixes() {
-        for parameter in ["-e", "-EC", "-enc", "-enco", "-encoded", "-EncodedCommand"] {
+        for parameter in [
+            "-e",
+            "-ec",
+            "-en",
+            "-enc",
+            "-enco",
+            "-encod",
+            "-encode",
+            "-encoded",
+            "-encodedc",
+            "-encodedco",
+            "-encodedcom",
+            "-encodedcomm",
+            "-encodedcomma",
+            "-encodedcomman",
+            "-encodedcommand",
+        ] {
             assert_flags(
                 &format!("pwsh {parameter} SQBFAFgA"),
                 "powershell-encoded-command",
@@ -2305,22 +2418,184 @@ mod tests {
     }
 
     #[test]
-    fn powershell_here_strings_are_inert_and_code_after_terminators_is_assessed() {
+    fn powershell_here_strings_expand_only_executable_subexpressions() {
         for command in [
             "$text = @'\nStop-Service Spooler; \"quotes\"; $(Stop-Service Spooler)\n'@\nGet-Service Spooler",
-            "$text = @\"\nStop-Service Spooler | $(Stop-Service Spooler)\n\"@\nGet-Service Spooler",
+            "$text = @\"\nStop-Service Spooler\n\"@\nGet-Service Spooler",
             "@'\nStop-Service Spooler\n'@",
             "$text = @'\nStop-Service Spooler\n  '@\nStop-Service Spooler",
-            "$text = @\"\n$(Stop-Service Spooler)\n\"@ trailing\nStop-Service Spooler",
+            "$text = @\"\n$(Stop-Service Spooler -WhatIf)\n\"@\nGet-Service Spooler",
         ] {
             assert_not_rule(command, "powershell-service-change");
         }
 
         for command in [
+            "$text = @\"\nStop-Service Spooler | $(Stop-Service Spooler)\n\"@\nGet-Service Spooler",
+            "$text = @\"\n$(Stop-Service Spooler)\n\"@ trailing\nGet-Service Spooler",
             "$text = @'\nStop-Service Spooler\n'@\nStop-Service Spooler",
             "$text = @\"\n$(Stop-Service Spooler)\n\"@\r\nStop-Service Spooler",
         ] {
             assert_flags(command, "powershell-service-change", RiskLevel::Destructive);
+        }
+    }
+
+    #[test]
+    fn policy_audit_regressions_cover_all_reported_blockers() {
+        let destructive = [
+            (
+                "$text = @\"\n$(Stop-Service Spooler)\n\"@",
+                "powershell-service-change",
+            ),
+            (
+                "Stop-Service -Name $(Write-Output Spooler; New-Item x -ItemType File -WhatIf:$true)",
+                "powershell-service-change",
+            ),
+            ("pwsh -co 'Stop-Service Spooler'", "powershell-service-change"),
+            (
+                "pwsh -CommandWithArgs 'Stop-Service Spooler'",
+                "powershell-service-change",
+            ),
+            (
+                "pwsh -ex Bypass -Command 'Get-Date'",
+                "powershell-execution-policy-bypass",
+            ),
+            (
+                "& 'reg.exe' DELETE HKLM\\Software\\Incant /f",
+                "windows-registry-native-change",
+            ),
+            (
+                "& 'sc.exe' delete Spooler",
+                "windows-service-native-change",
+            ),
+            (
+                "& 'schtasks.exe' /delete /tn Incant /f",
+                "windows-schtasks-change",
+            ),
+            (
+                "& 'wevtutil.exe' cl System",
+                "windows-event-log-native-clear",
+            ),
+            (
+                "Set-Partition -DiskNumber 2 -PartitionNumber 1 -NewDriveLetter Z",
+                "powershell-storage-change",
+            ),
+        ];
+        for (command, rule) in destructive {
+            assert_flags(command, rule, RiskLevel::Destructive);
+        }
+
+        assert_flags(
+            "saps pwsh -Verb RunAs",
+            "powershell-runas",
+            RiskLevel::Caution,
+        );
+
+        for command in [
+            "Write-Output foo`;Stop-Service Spooler",
+            "$block = { Stop-Service Spooler }",
+            "$text = @'\n$(Stop-Service Spooler)\n'@",
+        ] {
+            assert_not_rule(command, "powershell-service-change");
+        }
+        assert_flags(
+            "& { Stop-Service Spooler }",
+            "powershell-service-change",
+            RiskLevel::Destructive,
+        );
+    }
+
+    #[test]
+    fn launcher_parameter_prefixes_match_powershell_ambiguity_rules() {
+        for parameter in [
+            "-c", "-co", "-com", "-comm", "-comma", "-comman", "-command",
+        ] {
+            assert_flags(
+                &format!("pwsh {parameter} 'Stop-Service Spooler'"),
+                "powershell-service-change",
+                RiskLevel::Destructive,
+            );
+        }
+        for parameter in ["-Cwa", "-CommandWithArgs"] {
+            assert_flags(
+                &format!("pwsh {parameter} 'Stop-Service Spooler'"),
+                "powershell-service-change",
+                RiskLevel::Destructive,
+            );
+        }
+        for parameter in [
+            "-CommandW",
+            "-CommandWi",
+            "-CommandWit",
+            "-CommandWith",
+            "-CommandWithA",
+            "-CommandWithAr",
+            "-CommandWithArg",
+        ] {
+            assert_not_rule(
+                &format!("pwsh {parameter} 'Stop-Service Spooler'"),
+                "powershell-service-change",
+            );
+        }
+
+        for parameter in [
+            "-ep",
+            "-ex",
+            "-exe",
+            "-exec",
+            "-execu",
+            "-execut",
+            "-executi",
+            "-executio",
+            "-execution",
+            "-executionp",
+            "-executionpo",
+            "-executionpol",
+            "-executionpoli",
+            "-executionpolic",
+            "-executionpolicy",
+        ] {
+            assert_flags(
+                &format!("pwsh {parameter} Bypass -Command Get-Date"),
+                "powershell-execution-policy-bypass",
+                RiskLevel::Destructive,
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_native_executable_paths_are_assessed() {
+        let cases = [
+            (
+                "& 'C:\\Windows\\System32\\reg.exe' DELETE HKLM\\Software\\Incant /f",
+                "windows-registry-native-change",
+            ),
+            (
+                "& 'C:\\Windows\\System32\\sc.exe' delete Spooler",
+                "windows-service-native-change",
+            ),
+            (
+                "& 'C:\\Windows\\System32\\schtasks.exe' /delete /tn Incant /f",
+                "windows-schtasks-change",
+            ),
+            (
+                "& 'C:\\Windows\\System32\\wevtutil.exe' cl System",
+                "windows-event-log-native-clear",
+            ),
+        ];
+        for (command, rule) in cases {
+            assert_flags(command, rule, RiskLevel::Destructive);
+        }
+        for command in [
+            "Write-Output 'C:\\Windows\\System32\\reg.exe DELETE HKLM\\Software\\Incant /f'",
+            "Write-Output C:\\Windows\\System32\\sc.exe delete Spooler",
+            "Write-Output 'C:\\Windows\\System32\\schtasks.exe /delete /tn Incant /f'",
+            "Write-Output C:\\Windows\\System32\\wevtutil.exe cl System",
+        ] {
+            assert_eq!(
+                assess(command).level,
+                RiskLevel::Safe,
+                "{command:?} is inert diagnostic text"
+            );
         }
     }
 }
