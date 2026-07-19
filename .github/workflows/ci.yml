@@ -22,6 +22,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  installer:
+    name: Unix installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check shell syntax
+        run: bash -n install.sh tests/install_sh_integration.sh
+      - name: Lint shell scripts
+        run: shellcheck install.sh tests/install_sh_integration.sh
+      - name: Run installer behavior tests
+        run: bash tests/install_sh_integration.sh
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
