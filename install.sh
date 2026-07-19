@@ -6,6 +6,7 @@ set -e
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/incant}"
+SHELL_INTEGRATION_MODE="prompt"
 
 # Colors for output
 RED='\033[0;31m'
@@ -25,6 +26,70 @@ error() {
     echo -e "${RED}[ERROR]${NC} $1"
     exit 1
 }
+
+usage() {
+    printf 'Usage: %s [--with-shell-integration | --no-shell-integration]\n' "${0##*/}"
+}
+
+argument_error() {
+    printf '%b\n' "${RED}[ERROR]${NC} $1" >&2
+    usage >&2
+    return 2
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --with-shell-integration)
+                if [ "$SHELL_INTEGRATION_MODE" = "skip" ]; then
+                    argument_error "--with-shell-integration and --no-shell-integration are mutually exclusive"
+                    return $?
+                fi
+                SHELL_INTEGRATION_MODE="install"
+                ;;
+            --no-shell-integration)
+                if [ "$SHELL_INTEGRATION_MODE" = "install" ]; then
+                    argument_error "--with-shell-integration and --no-shell-integration are mutually exclusive"
+                    return $?
+                fi
+                SHELL_INTEGRATION_MODE="skip"
+                ;;
+            *)
+                argument_error "Unknown argument: $1"
+                return $?
+                ;;
+        esac
+        shift
+    done
+}
+
+interactive_tty_available() {
+    [ -t 0 ] && ( : </dev/tty ) 2>/dev/null
+}
+
+prompt_yes_no() {
+    local prompt=$1
+    local default_answer=$2
+    local answer=""
+
+    if ! IFS= read -r -n 1 -p "$prompt" answer </dev/tty; then
+        return 1
+    fi
+    printf '\n' >/dev/tty
+
+    case "$answer" in
+        [Yy])
+            return 0
+            ;;
+        [Nn])
+            return 1
+            ;;
+        *)
+            [ "$default_answer" = "yes" ]
+            ;;
+    esac
+}
+
 
 # Check if Rust is installed
 check_rust() {
@@ -68,13 +133,35 @@ create_config() {
 
 # Setup shell integration
 setup_shell_integration() {
-    local shell_name=$(basename "$SHELL")
+    local shell_name
     local shell_config=""
     local integration=""
+    local reply=""
+
+    if [ "$SHELL_INTEGRATION_MODE" = "skip" ]; then
+        info "Skipping shell integration (--no-shell-integration)"
+        return
+    fi
+
+    if [ "$SHELL_INTEGRATION_MODE" = "prompt" ]; then
+        if [ ! -t 0 ]; then
+            info "Skipping shell integration: non-interactive input detected; use --with-shell-integration to enable it"
+            return
+        fi
+
+        if ! ( : </dev/tty ) 2>/dev/null; then
+            info "Skipping shell integration: no controlling TTY available; use --with-shell-integration to enable it"
+            return
+        fi
+    fi
+
+    shell_name=$(basename "$SHELL")
 
     case "$shell_name" in
         zsh)
             shell_config="$HOME/.zshrc"
+            # Variables in this snippet must expand in the user's shell.
+            # shellcheck disable=SC2016
             integration='
 # incant shell integration
 function _incant_widget() {
@@ -92,6 +179,8 @@ bindkey '"'"'^k'"'"' _incant_widget'
             ;;
         bash)
             shell_config="$HOME/.bashrc"
+            # Variables in this snippet must expand in the user's shell.
+            # shellcheck disable=SC2016
             integration='
 # incant shell integration
 _incant_readline() {
@@ -105,6 +194,8 @@ bind -x '"'"'"\C-k": _incant_readline'"'"''
             ;;
         fish)
             shell_config="$HOME/.config/fish/config.fish"
+            # Variables in this snippet must expand in the user's shell.
+            # shellcheck disable=SC2016
             integration='
 # incant shell integration
 function _incant_fish
@@ -127,23 +218,31 @@ bind \ck _incant_fish'
         return
     fi
 
-    # Ask user
-    echo ""
-    info "Shell integration for $shell_name"
-    echo "This will add the following to $shell_config:"
-    echo "$integration"
-    echo ""
-    read -p "Install shell integration? [y/N] " -n 1 -r
-    echo ""
+    if [ "$SHELL_INTEGRATION_MODE" = "prompt" ]; then
+        echo ""
+        info "Shell integration for $shell_name"
+        echo "This will add the following to $shell_config:"
+        echo "$integration"
+        echo ""
 
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "$integration" >> "$shell_config"
-        info "Shell integration added to $shell_config"
-        info "Restart your shell or run: source $shell_config"
-    else
-        info "Skipping shell integration"
-        info "Run 'incant install' later to see manual setup instructions"
+        if ! IFS= read -r -n 1 -p "Install shell integration? [y/N] " reply </dev/tty; then
+            echo ""
+            info "Skipping shell integration: unable to read from /dev/tty"
+            info "Use --with-shell-integration to enable it non-interactively"
+            return
+        fi
+        echo ""
+
+        if [[ ! $reply =~ ^[Yy]$ ]]; then
+            info "Skipping shell integration"
+            info "Run 'incant install' later to see manual setup instructions"
+            return
+        fi
     fi
+
+    echo "$integration" >> "$shell_config"
+    info "Shell integration added to $shell_config"
+    info "Restart your shell or run: source $shell_config"
 }
 
 # Detect OS
@@ -257,10 +356,15 @@ setup_ollama() {
         echo ""
         info "Ollama is not installed (required for local LLM support)"
         echo ""
-        read -p "Install Ollama now? [Y/n] " -n 1 -r
-        echo ""
 
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        if ! interactive_tty_available; then
+            warn "Skipping Ollama installation: interactive terminal input is unavailable"
+            warn "Configure an API backend (Anthropic/OpenAI) in $CONFIG_DIR/config.toml"
+            warn "Or install Ollama later from https://ollama.ai/"
+            return 0
+        fi
+
+        if prompt_yes_no "Install Ollama now? [Y/n] " yes; then
             install_ollama
         else
             warn "Skipping Ollama installation"
@@ -275,10 +379,14 @@ setup_ollama() {
         info "Ollama is running"
     else
         echo ""
-        read -p "Start Ollama now? [Y/n] " -n 1 -r
-        echo ""
 
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        if ! interactive_tty_available; then
+            warn "Skipping Ollama startup: interactive terminal input is unavailable"
+            warn "Ollama is not running. Start with: ollama serve"
+            return 0
+        fi
+
+        if prompt_yes_no "Start Ollama now? [Y/n] " yes; then
             start_ollama
         else
             warn "Ollama is not running. Start with: ollama serve"
@@ -288,12 +396,15 @@ setup_ollama() {
 
     # Check if Ollama is running before trying to pull
     if curl -s http://localhost:11434/api/tags &> /dev/null; then
-        # Offer to pull default model
-        echo ""
-        read -p "Pull the default model (qwen2.5-coder:7b, ~4.7GB)? [Y/n] " -n 1 -r
         echo ""
 
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        if ! interactive_tty_available; then
+            info "Skipping model download: interactive terminal input is unavailable"
+            info "Pull later with: ollama pull qwen2.5-coder:7b"
+            return 0
+        fi
+
+        if prompt_yes_no "Pull the default model (qwen2.5-coder:7b, ~4.7GB)? [Y/n] " yes; then
             pull_default_model
         else
             info "Skipping model download. Pull later with: ollama pull qwen2.5-coder:7b"
@@ -303,6 +414,8 @@ setup_ollama() {
 
 # Main installation flow
 main() {
+    parse_args "$@"
+
     echo "================================"
     echo "  incant Installation"
     echo "================================"
