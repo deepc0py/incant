@@ -381,8 +381,10 @@ fn powershell_separator_len(raw: &[u8], index: usize) -> usize {
 }
 
 static NESTED_POWERSHELL_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b(?:pwsh|powershell)(?:\.exe)?\b[^\r\n|;]*?-(?:command|c)\s+(?<quote>['"])"#)
-        .expect("static nested PowerShell pattern must compile")
+    Regex::new(
+        r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:pwsh|powershell)(?:\.exe)?\b[^\r\n|;]*?-(?<parameter>commandwithargs|command|c)\b"#,
+    )
+    .expect("static nested PowerShell pattern must compile")
 });
 
 fn powershell_sources(command: &str) -> Vec<PowerShellSource<'_>> {
@@ -394,7 +396,9 @@ fn powershell_sources(command: &str) -> Vec<PowerShellSource<'_>> {
         let text = pending[index];
         let source = PowerShellSource::new(text);
         if pending.len() < 16 {
-            for payload in nested_powershell_payloads(text, &source.lex) {
+            let mut discovered = nested_powershell_payloads(text, &source.lex);
+            discovered.extend(expandable_string_subexpressions(text));
+            for payload in discovered {
                 let duplicate = pending.iter().any(|known| {
                     known.as_ptr() == payload.as_ptr() && known.len() == payload.len()
                 });
@@ -410,16 +414,44 @@ fn powershell_sources(command: &str) -> Vec<PowerShellSource<'_>> {
 }
 
 fn nested_powershell_payloads<'a>(command: &'a str, lex: &PowerShellLex) -> Vec<&'a str> {
-    NESTED_POWERSHELL_COMMAND
-        .captures_iter(command)
-        .filter_map(|captures| {
-            let matched = captures.get(0)?;
-            lex.operation_start(command, matched.start(), matched.end())?;
-            let quote = captures.name("quote")?;
-            let end = powershell_quote_end(command, quote.start())?;
-            Some(&command[quote.end()..end])
-        })
-        .collect()
+    let mut payloads = Vec::new();
+    for &start in &lex.command_starts {
+        let untrimmed = &command[start..];
+        let candidate = untrimmed.trim_start_matches(char::is_whitespace);
+        let candidate_start = start + (untrimmed.len() - candidate.len());
+        for captures in NESTED_POWERSHELL_COMMAND.captures_iter(candidate) {
+            let matched = captures.get(0).expect("the full regex match always exists");
+            let match_start = candidate_start + matched.start();
+            let match_end = candidate_start + matched.end();
+            let Some(operation_start) = lex.operation_start(command, match_start, match_end) else {
+                continue;
+            };
+            let parameter = captures
+                .name("parameter")
+                .expect("the parameter capture always exists");
+            let mut argument_start = candidate_start + parameter.end();
+            let invocation_end = lex.invocation_end(command, operation_start);
+            while argument_start < invocation_end
+                && command.as_bytes()[argument_start].is_ascii_whitespace()
+            {
+                argument_start += 1;
+            }
+            if argument_start >= invocation_end {
+                continue;
+            }
+
+            if matches!(command.as_bytes()[argument_start], b'\'' | b'"') {
+                if let Some(end) = powershell_quote_end(command, argument_start) {
+                    if end <= invocation_end {
+                        payloads.push(&command[argument_start + 1..end]);
+                    }
+                }
+            } else {
+                payloads.push(command[argument_start..invocation_end].trim_end());
+            }
+        }
+    }
+    payloads
 }
 
 fn powershell_quote_end(command: &str, quote_start: usize) -> Option<usize> {
@@ -437,6 +469,158 @@ fn powershell_quote_end(command: &str, quote_start: usize) -> Option<usize> {
         }
         if raw[index] == quote {
             return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn expandable_string_subexpressions(command: &str) -> Vec<&str> {
+    let raw = command.as_bytes();
+    let mut payloads = Vec::new();
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut index = 0;
+
+    while index < raw.len() {
+        if line_comment {
+            if matches!(raw[index], b'\r' | b'\n') {
+                line_comment = false;
+            } else {
+                index += 1;
+                continue;
+            }
+        }
+        if block_comment {
+            if raw[index] == b'#' && raw.get(index + 1) == Some(&b'>') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        match quote {
+            Some(b'\'') => {
+                if raw[index] == b'\'' {
+                    if raw.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+            }
+            Some(b'"') => {
+                if raw[index] == b'`' && index + 1 < raw.len() {
+                    index += 2;
+                    continue;
+                }
+                if raw[index] == b'"' {
+                    quote = None;
+                } else if raw[index] == b'$' && raw.get(index + 1) == Some(&b'(') {
+                    if let Some(end) = powershell_subexpression_end(command, index + 1) {
+                        payloads.push(&command[index + 2..end]);
+                        index = end;
+                    }
+                }
+            }
+            Some(_) => unreachable!("only PowerShell quote bytes are stored"),
+            None => {
+                if raw[index] == b'<' && raw.get(index + 1) == Some(&b'#') {
+                    block_comment = true;
+                    index += 2;
+                    continue;
+                }
+                if raw[index] == b'#' {
+                    line_comment = true;
+                } else if raw[index] == b'`' && index + 1 < raw.len() {
+                    index += 2;
+                    continue;
+                } else if matches!(raw[index], b'\'' | b'"') {
+                    quote = Some(raw[index]);
+                }
+            }
+        }
+        index += 1;
+    }
+    payloads
+}
+
+fn powershell_subexpression_end(command: &str, open_paren: usize) -> Option<usize> {
+    let raw = command.as_bytes();
+    let mut depth = 1_u16;
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut index = open_paren + 1;
+
+    while index < raw.len() {
+        if line_comment {
+            if matches!(raw[index], b'\r' | b'\n') {
+                line_comment = false;
+            } else {
+                index += 1;
+                continue;
+            }
+        }
+        if block_comment {
+            if raw[index] == b'#' && raw.get(index + 1) == Some(&b'>') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        match quote {
+            Some(b'\'') => {
+                if raw[index] == b'\'' {
+                    if raw.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+            }
+            Some(b'"') => {
+                if raw[index] == b'`' && index + 1 < raw.len() {
+                    index += 2;
+                    continue;
+                }
+                if raw[index] == b'"' {
+                    quote = None;
+                } else if raw[index] == b'$' && raw.get(index + 1) == Some(&b'(') {
+                    depth = depth.saturating_add(1);
+                    index += 2;
+                    continue;
+                }
+            }
+            Some(_) => unreachable!("only PowerShell quote bytes are stored"),
+            None => {
+                if raw[index] == b'<' && raw.get(index + 1) == Some(&b'#') {
+                    block_comment = true;
+                    index += 2;
+                    continue;
+                }
+                if raw[index] == b'#' {
+                    line_comment = true;
+                } else if raw[index] == b'`' && index + 1 < raw.len() {
+                    index += 2;
+                    continue;
+                } else if matches!(raw[index], b'\'' | b'"') {
+                    quote = Some(raw[index]);
+                } else if raw[index] == b'(' {
+                    depth = depth.saturating_add(1);
+                } else if raw[index] == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+            }
         }
         index += 1;
     }
@@ -543,7 +727,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "powershell-registry-change",
             RiskLevel::Destructive,
             "changes or removes Windows registry keys or values",
-            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:remove-item|ri|rm|del|erase|rd|rmdir|remove-itemproperty|rp|clear-item|cli|clear-itemproperty|clp|set-item|si|set-itemproperty|sp|new-item|ni|new-itemproperty|rename-item|rni|move-item|mi|copy-item|cpi)\b['"]?[^|;\r\n]*(?:registry::|hk(?:lm|cu|cr|u|cc):)"#],
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:remove-item|ri|rm|del|erase|rd|rmdir|remove-itemproperty|rp|clear-item|cli|clear-itemproperty|clp|set-item|si|set-itemproperty|sp|new-item|ni|new-itemproperty|rename-item|rni|rename-itemproperty|rnp|move-item|mi|move-itemproperty|mp|copy-item|cpi)\b['"]?[^|;\r\n]*(?:registry::|hk(?:lm|cu|cr|u|cc):)"#],
             Some(POWERSHELL_WHAT_IF),
         ),
         Rule::new(
@@ -599,14 +783,14 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "powershell-storage-change",
             RiskLevel::Destructive,
             "initializes, formats, clears, resizes, or repartitions storage",
-            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:clear-disk|initialize-disk|format-volume|remove-partition|resize-partition|set-disk)\b['"]?"#],
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:clear-disk|initialize-disk|format-volume|new-partition|remove-partition|resize-partition|set-disk)\b['"]?"#],
             Some(POWERSHELL_WHAT_IF),
         ),
         Rule::new(
             "powershell-firewall-change",
             RiskLevel::Destructive,
             "changes or removes Windows Firewall policy",
-            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:(?:new|set|remove|disable)-netfirewall(?:rule|profile))\b['"]?"#],
+            &[r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:(?:new|set|remove|disable|enable)-netfirewall(?:rule|profile))\b['"]?"#],
             Some(POWERSHELL_WHAT_IF),
         ),
         Rule::new(
@@ -1593,5 +1777,91 @@ mod tests {
             "powershell-service-change",
             RiskLevel::Destructive,
         );
+    }
+    #[test]
+    fn executable_subexpressions_and_unquoted_nested_commands_are_assessed() {
+        for command in [
+            "Write-Output \"$(Stop-Service Spooler)\"",
+            "Write-Output \"$(& { Stop-Service Spooler })\"",
+            "pwsh -Command Stop-Service Spooler",
+            "powershell.exe -c Stop-Service Spooler",
+            "pwsh -CommandWithArgs { Stop-Service Spooler } ignored",
+            "pwsh -Command Stop-Service Spooler; Get-Service -WhatIf",
+        ] {
+            assert_flags(command, "powershell-service-change", RiskLevel::Destructive);
+        }
+
+        for command in [
+            "Write-Output '$(Stop-Service Spooler)'",
+            "Write-Output \"`$(Stop-Service Spooler)\"",
+            "Write-Output \"$(Write-Output 'Stop-Service Spooler')\"",
+            "Write-Output \"$([string]'Stop-Service Spooler')\"",
+            "Write-Output 'pwsh -Command Stop-Service Spooler'",
+            "pwsh -Command Write-Output 'Stop-Service Spooler'",
+            "pwsh -Command Stop-Service Spooler -WhatIf; Get-Date",
+            "pwsh -File diagnostics.ps1 -CommandText Stop-Service",
+        ] {
+            assert_safe(command);
+        }
+    }
+
+    #[test]
+    fn additional_registry_storage_and_firewall_mutations_are_covered() {
+        let destructive = [
+            (
+                "Rename-ItemProperty -Path 'HKLM:\\Software\\Incant' -Name Old -NewName New",
+                "powershell-registry-change",
+            ),
+            (
+                "rnp 'HKCU:\\Software\\Incant' Old New",
+                "powershell-registry-change",
+            ),
+            (
+                "Move-ItemProperty -Path 'HKLM:\\Software\\Incant' -Name Value -Destination 'HKCU:\\Software\\Incant'",
+                "powershell-registry-change",
+            ),
+            (
+                "mp 'HKCU:\\Software\\Incant' Value 'HKLM:\\Software\\Incant'",
+                "powershell-registry-change",
+            ),
+            (
+                "New-Partition -DiskNumber 2 -UseMaximumSize",
+                "powershell-storage-change",
+            ),
+            (
+                "Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'",
+                "powershell-firewall-change",
+            ),
+        ];
+        for (command, rule) in destructive {
+            assert_flags(command, rule, RiskLevel::Destructive);
+        }
+
+        let benign = [
+            (
+                "Rename-ItemProperty -Path 'C:\\Temp' -Name Old -NewName New",
+                "powershell-registry-change",
+            ),
+            (
+                "Write-Output \"rnp HKLM:\\Software\\Incant Old New\"",
+                "powershell-registry-change",
+            ),
+            ("Get-Partition -DiskNumber 2", "powershell-storage-change"),
+            (
+                "New-Partition -DiskNumber 2 -WhatIf",
+                "powershell-storage-change",
+            ),
+            (
+                "Get-NetFirewallRule -DisplayGroup 'Remote Desktop'",
+                "powershell-firewall-change",
+            ),
+            (
+                "Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -WhatIf",
+                "powershell-firewall-change",
+            ),
+        ];
+        for (command, rule) in benign {
+            assert_not_rule(command, rule);
+        }
     }
 }
