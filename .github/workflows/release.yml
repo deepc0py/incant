@@ -33,7 +33,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: 1.88.0
+          toolchain: 1.97.1
       - name: Require requested version to equal Cargo package version
         id: version
         shell: bash
@@ -92,14 +92,15 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: aarch64-pc-windows-msvc
-            os: windows-latest
+            os: windows-11-arm
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       INCANT_RELEASE_VERSION: ${{ needs.validate-tag.outputs.version }}
     steps:
@@ -108,32 +109,35 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: 1.88.0
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
 
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cargo-auditable@0.7.5
+          fallback: none
+
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo auditable build --release --locked --target ${{ matrix.target }}
 
       - name: Smoke test (Unix)
-        # Every Unix target runs natively on its runner (x86_64-apple-darwin
-        # via Rosetta 2 on the arm64 macOS runner).
+        # Every Unix target runs natively on a matching-architecture runner.
         if: runner.os != 'Windows'
         run: ./target/${{ matrix.target }}/release/incant --version
 
-      # The x86_64 Windows binary must answer from both supported entry
-      # points. aarch64-pc-windows-msvc is cross-compiled: GitHub's x64
-      # Windows runner cannot execute ARM64 binaries, so its native smoke
-      # test runs in the Windows 11 ARM VM before the release is cut.
+      # Both Windows targets run natively and must answer from PowerShell and
+      # CMD before their artifacts leave the build job.
       - name: Smoke test (pwsh)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: endsWith(matrix.target, '-pc-windows-msvc')
         shell: pwsh
         run: '& ./target/${{ matrix.target }}/release/incant.exe --version'
 
       - name: Smoke test (CMD)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: endsWith(matrix.target, '-pc-windows-msvc')
         shell: cmd
         run: target\${{ matrix.target }}\release\incant.exe --version
 
@@ -155,6 +159,28 @@ jobs:
           "${{ steps.syft.outputs.cmd }}" "dir:$name" \
             -o "cyclonedx-json=$name.cdx.json" \
             -o "spdx-json=$name.spdx.json"
+          jq -e '
+            .bomFormat == "CycloneDX" and
+            ([.components[]?.name] |
+              (index("incant") != null and
+               index("tokio") != null and
+               index("serde") != null and
+               index("clap") != null))
+          ' "$name.cdx.json" >/dev/null || {
+            echo "$name.cdx.json lacks required Rust dependency components" >&2
+            exit 1
+          }
+          jq -e '
+            (.spdxVersion | startswith("SPDX-")) and
+            ([.packages[]?.name] |
+              (index("incant") != null and
+               index("tokio") != null and
+               index("serde") != null and
+               index("clap") != null))
+          ' "$name.spdx.json" >/dev/null || {
+            echo "$name.spdx.json lacks required Rust dependency packages" >&2
+            exit 1
+          }
           tar -czf "$name.tar.gz" "$name"
           for file in "$name.tar.gz" "$name.cdx.json" "$name.spdx.json"; do
             shasum -a 256 "$file" > "$file.sha256"
@@ -175,6 +201,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
               throw "Syft failed with status $LASTEXITCODE."
           }
+          $requiredRustPackages = @('incant', 'tokio', 'serde', 'clap')
+          $cdxPath = "$name.cdx.json"
+          $cdx = Get-Content -LiteralPath $cdxPath -Raw | ConvertFrom-Json -Depth 100
+          $cdxNames = @($cdx.components | ForEach-Object { $_.name })
+          $missingCdx = @($requiredRustPackages | Where-Object { $_ -cnotin $cdxNames })
+          if ($cdx.bomFormat -cne 'CycloneDX' -or $missingCdx.Count -ne 0) {
+              throw "$cdxPath lacks required Rust dependency components: $($missingCdx -join ', ')."
+          }
+          $spdxPath = "$name.spdx.json"
+          $spdx = Get-Content -LiteralPath $spdxPath -Raw | ConvertFrom-Json -Depth 100
+          $spdxNames = @($spdx.packages | ForEach-Object { $_.name })
+          $missingSpdx = @($requiredRustPackages | Where-Object { $_ -cnotin $spdxNames })
+          if ($spdx.spdxVersion -notmatch '^SPDX-' -or $missingSpdx.Count -ne 0) {
+              throw "$spdxPath lacks required Rust dependency packages: $($missingSpdx -join ', ')."
+          }
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           foreach ($file in @("$name.zip", "$name.cdx.json", "$name.spdx.json")) {
               $hash = (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLowerInvariant()
@@ -194,13 +235,10 @@ jobs:
             incant-*.spdx.json
             incant-*.spdx.json.sha256
           if-no-files-found: error
-  publish:
-    name: publish release
+  assemble:
+    name: assemble verified release candidate
     needs: [validate-tag, build]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -243,52 +281,13 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-manifest
-          path: dist/SHA256SUMS
+          path: dist
           if-no-files-found: error
 
-      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.cdx.json
-            dist/*.spdx.json
-            dist/install.ps1
-            dist/SHA256SUMS
-          body: |
-            ## Windows support
-
-            Incant supports Windows 10 and Windows 11 on x64 and ARM64. No 32-bit Windows build is published. PowerShell 7.4 or newer is required for the installer and PSReadLine integration.
-
-            Download the asset, `SHA256SUMS`, and `install.ps1`. Verify the installer's checksum:
-
-            ```powershell
-            $expected = ((Get-Content .\SHA256SUMS | Where-Object { $_ -match '  install\.ps1$' }) -split '  ')[0]
-            $actual = (Get-FileHash .\install.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actual -cne $expected) { throw 'SHA-256 mismatch for install.ps1' }
-            ```
-
-            Verify the downloaded archive's build provenance:
-
-            ```text
-            gh attestation verify <asset> --repo deepc0py/incant
-            ```
-
-            Install the verified release:
-
-            ```powershell
-            pwsh -File .\install.ps1 -Version ${{ needs.validate-tag.outputs.version }}
-            ```
-
-            Generated commands are untrusted text. Review every command before pressing Enter; Incant never executes a generated command for you.
-          append_body: true
-          generate_release_notes: true
-          fail_on_unmatched_files: true
 
   provenance:
     name: attest release provenance
-    needs: publish
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: assemble
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -300,33 +299,65 @@ jobs:
         with:
           name: release-manifest
           path: dist
-      - uses: actions/attest-build-provenance@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-checksums: dist/SHA256SUMS
+      - name: Attest the aggregate checksum manifest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/SHA256SUMS
 
-  verify-windows-release:
-    name: verify published Windows release
-    needs: [validate-tag, publish, provenance]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: windows-latest
-    timeout-minutes: 5
+  # One anchored gate keeps private-artifact and public-prerelease proof identical.
+  # Only the download source differs; both architectures run the same installer,
+  # version, detached lifecycle, concurrent named-pipe, and uninstall assertions.
+  verify-windows-candidate:
+    name: verify private candidate (${{ matrix.target }})
+    needs: [validate-tag, assemble, provenance]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     permissions:
       contents: read
+      attestations: read
     env:
       GH_TOKEN: ${{ github.token }}
       INCANT_RELEASE_VERSION: ${{ needs.validate-tag.outputs.version }}
-    steps:
-      - name: Download and verify published assets
+      INCANT_RELEASE_TARGET: ${{ matrix.target }}
+      INCANT_E2E_SOURCE: artifact
+    steps: &windows-release-e2e
+      - if: env.INCANT_E2E_SOURCE == 'artifact'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-manifest
+          path: dist
+      - name: Download public prerelease assets
+        if: env.INCANT_E2E_SOURCE == 'public'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path dist | Out-Null
-          gh release download $env:GITHUB_REF_NAME `
+          gh release download "v$env:INCANT_RELEASE_VERSION" `
               --repo $env:GITHUB_REPOSITORY `
-              --dir dist
+              --dir dist `
+              --pattern 'incant-*' `
+              --pattern 'SHA256SUMS'
           if ($LASTEXITCODE -ne 0) {
-              throw "gh release download failed with status $LASTEXITCODE."
+              throw "Public prerelease asset download failed with status $LASTEXITCODE."
           }
+          $installerUri = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$env:INCANT_RELEASE_VERSION/install.ps1"
+          Invoke-WebRequest -Uri $installerUri -OutFile dist/install.ps1
+
+      - name: Verify candidate assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
 
           $version = $env:INCANT_RELEASE_VERSION
           $targets = @(
@@ -374,18 +405,30 @@ jobs:
               throw 'SHA256SUMS does not cover every published payload.'
           }
 
+          $requiredRustPackages = @('incant', 'tokio', 'serde', 'clap')
           foreach ($sbomPath in Get-ChildItem -LiteralPath dist -Filter '*.json' -File) {
               $sbom = Get-Content -LiteralPath $sbomPath.FullName -Raw | ConvertFrom-Json -Depth 100
-              if ($sbomPath.Name.EndsWith('.cdx.json') -and $sbom.bomFormat -cne 'CycloneDX') {
-                  throw "$($sbomPath.Name) is not a CycloneDX JSON document."
+              if ($sbomPath.Name.EndsWith('.cdx.json')) {
+                  $names = @($sbom.components | ForEach-Object { $_.name })
+                  $missing = @($requiredRustPackages | Where-Object { $_ -cnotin $names })
+                  if ($sbom.bomFormat -cne 'CycloneDX' -or $missing.Count -ne 0) {
+                      throw "$($sbomPath.Name) lacks required Rust components: $($missing -join ', ')."
+                  }
               }
-              if ($sbomPath.Name.EndsWith('.spdx.json') -and $sbom.spdxVersion -notmatch '^SPDX-') {
-                  throw "$($sbomPath.Name) is not an SPDX JSON document."
+              elseif ($sbomPath.Name.EndsWith('.spdx.json')) {
+                  $names = @($sbom.packages | ForEach-Object { $_.name })
+                  $missing = @($requiredRustPackages | Where-Object { $_ -cnotin $names })
+                  if ($sbom.spdxVersion -notmatch '^SPDX-' -or $missing.Count -ne 0) {
+                      throw "$($sbomPath.Name) lacks required Rust packages: $($missing -join ', ')."
+                  }
+              }
+              else {
+                  throw "Unexpected JSON release asset: $($sbomPath.Name)."
               }
           }
 
           foreach ($attestedName in @(
-              "incant-$version-x86_64-pc-windows-msvc.zip",
+              "incant-$version-$env:INCANT_RELEASE_TARGET.zip",
               'install.ps1'
           )) {
               gh attestation verify (Join-Path dist $attestedName) --repo $env:GITHUB_REPOSITORY
@@ -399,11 +442,15 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $version = $env:INCANT_RELEASE_VERSION
-          $testRoot = Join-Path $env:RUNNER_TEMP 'incant-release-e2e'
+          $testRoot = Join-Path $env:RUNNER_TEMP "incant-$env:INCANT_E2E_SOURCE-e2e-$env:INCANT_RELEASE_TARGET"
           $env:LOCALAPPDATA = Join-Path $testRoot 'local-app-data'
           $installDir = Join-Path $env:LOCALAPPDATA 'Incant\bin'
           $configDir = Join-Path $env:LOCALAPPDATA 'incant'
           $profilePath = Join-Path $testRoot 'profile.ps1'
+          $assetScript = Join-Path $testRoot 'asset-server.ps1'
+          $assetStdout = Join-Path $testRoot 'asset-server.stdout'
+          $assetStderr = Join-Path $testRoot 'asset-server.stderr'
+          $assetPort = 18081
           $mockScript = Join-Path $testRoot 'mock-ollama.ps1'
           $mockStdout = Join-Path $testRoot 'mock-ollama.stdout'
           $mockStderr = Join-Path $testRoot 'mock-ollama.stderr'
@@ -411,6 +458,69 @@ jobs:
           $profileStartMarker = '# >>> incant PSReadLine integration >>>'
           $profileEndMarker = '# <<< incant PSReadLine integration <<<'
           New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+
+          @'
+          param(
+              [Parameter(Mandatory)][string] $Root,
+              [Parameter(Mandatory)][string] $Version,
+              [Parameter(Mandatory)][int] $Port
+          )
+          $ErrorActionPreference = 'Stop'
+          $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port)
+          $listener.Start()
+          try {
+              while ($true) {
+                  $client = $listener.AcceptTcpClient()
+                  try {
+                      $stream = $client.GetStream()
+                      $reader = [IO.StreamReader]::new(
+                          $stream, [Text.Encoding]::ASCII, $false, 1024, $true
+                      )
+                      $requestLine = $reader.ReadLine()
+                      while ($null -ne ($line = $reader.ReadLine()) -and $line -ne '') {}
+                      $prefix = "/v$Version/"
+                      $requestPath = if ($requestLine -match '^GET (?<path>[^ ]+) HTTP/') {
+                          [Uri]::UnescapeDataString($Matches.path)
+                      }
+                      else {
+                          ''
+                      }
+                      $name = if ($requestPath.StartsWith($prefix, [StringComparison]::Ordinal)) {
+                          $requestPath.Substring($prefix.Length)
+                      }
+                      else {
+                          ''
+                      }
+                      $path = if ($name -and $name -eq [IO.Path]::GetFileName($name)) {
+                          Join-Path $Root $name
+                      }
+                      else {
+                          ''
+                      }
+                      if ($path -and (Test-Path -LiteralPath $path -PathType Leaf)) {
+                          $body = [IO.File]::ReadAllBytes($path)
+                          $status = '200 OK'
+                      }
+                      else {
+                          $body = [Text.Encoding]::UTF8.GetBytes('not found')
+                          $status = '404 Not Found'
+                      }
+                      $headers = [Text.Encoding]::ASCII.GetBytes(
+                          "HTTP/1.1 $status`r`nContent-Type: application/octet-stream`r`nContent-Length: $($body.Length)`r`nConnection: close`r`n`r`n"
+                      )
+                      $stream.Write($headers)
+                      $stream.Write($body)
+                      $stream.Flush()
+                  }
+                  finally {
+                      $client.Dispose()
+                  }
+              }
+          }
+          finally {
+              $listener.Stop()
+          }
+          '@ | Set-Content -LiteralPath $assetScript -Encoding utf8
 
           @'
           $ErrorActionPreference = 'Stop'
@@ -467,7 +577,15 @@ jobs:
           }
           '@ | Set-Content -LiteralPath $mockScript -Encoding utf8
 
+          $asset = $null
           $mock = $null
+          $queryProcesses = [Collections.Generic.List[object]]::new()
+          $proofLabel = if ($env:INCANT_E2E_SOURCE -eq 'public') {
+              'Public prerelease'
+          }
+          else {
+              'Private candidate'
+          }
           $installAttempted = $false
           $uninstallCompleted = $false
           $incant = Join-Path $installDir 'incant.exe'
@@ -499,23 +617,61 @@ jobs:
               }
           }
 
+          $primaryFailure = $null
           try {
+              if ($env:INCANT_E2E_SOURCE -eq 'artifact') {
+                  $asset = Start-Process -FilePath pwsh `
+                      -ArgumentList @(
+                          '-NoLogo', '-NoProfile', '-File', $assetScript,
+                          '-Root', (Resolve-Path -LiteralPath ./dist).Path,
+                          '-Version', $version, '-Port', $assetPort
+                      ) `
+                      -RedirectStandardOutput $assetStdout `
+                      -RedirectStandardError $assetStderr `
+                      -PassThru
+                  $assetReady = $false
+                  foreach ($attempt in 1..20) {
+                      if ($asset.HasExited) {
+                          throw "Candidate asset server exited: $(Get-Content -LiteralPath $assetStderr -Raw)"
+                      }
+                      try {
+                          Invoke-WebRequest `
+                              -Uri "http://127.0.0.1:$assetPort/v$version/SHA256SUMS" `
+                              -TimeoutSec 1 | Out-Null
+                          $assetReady = $true
+                          break
+                      }
+                      catch {
+                          Start-Sleep -Milliseconds 100
+                      }
+                  }
+                  if (-not $assetReady) {
+                      throw 'Candidate asset server did not become ready.'
+                  }
+              }
+
+              $installArguments = @{
+                  Version = $version
+                  InstallDir = $installDir
+                  ConfigDir = $configDir
+                  ProfilePath = $profilePath
+              }
+              if ($env:INCANT_E2E_SOURCE -eq 'artifact') {
+                  $installArguments.ReleaseBaseUri = "http://127.0.0.1:$assetPort"
+              }
               $installAttempted = $true
-              & ./dist/install.ps1 -Version $version `
-                  -InstallDir $installDir `
-                  -ConfigDir $configDir `
-                  -ProfilePath $profilePath
+              & ./dist/install.ps1 @installArguments
               if ($LASTEXITCODE -notin @(0, $null)) {
-                  throw "Published install.ps1 failed with status $LASTEXITCODE."
+                  throw "$proofLabel install.ps1 failed with status $LASTEXITCODE."
               }
               if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-                  throw 'Published installer did not create config.toml.'
+                  throw "$proofLabel installer did not create config.toml."
               }
               $configHashBefore = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
               $installedProfile = Get-Content -LiteralPath $profilePath -Raw
               if (-not $installedProfile.Contains($profileStartMarker) -or
                   -not $installedProfile.Contains($profileEndMarker)) {
-                  throw 'Published installer did not create the owned PowerShell profile block.'
+                  throw "$proofLabel installer did not create the owned PowerShell profile block."
               }
 
               $versionResult = Invoke-IncantBounded -Arguments @('--version')
@@ -557,9 +713,40 @@ jobs:
                   $statusLines[0] -cne 'Daemon: running') {
                   throw "daemon status failed: $($status.Stdout) $($status.Stderr)"
               }
-              $query = Invoke-IncantBounded -Arguments @('release-e2e-query')
-              if ($query.ExitCode -ne 0 -or $query.Stdout -cne 'echo release-e2e') {
-                  throw "named-pipe query mismatch: $($query.Stdout) $($query.Stderr)"
+              $pidPath = Join-Path $configDir 'run\incant.pid'
+              if (-not (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
+                  throw 'daemon start did not write its PID file.'
+              }
+              $daemonPid = [int](Get-Content -LiteralPath $pidPath -Raw)
+              $daemonProcess = Get-Process -Id $daemonPid -ErrorAction Stop
+              $daemonProcess.Refresh()
+              if ($daemonProcess.MainWindowHandle -ne [IntPtr]::Zero) {
+                  throw "detached daemon exposed a visible top-level window: $($daemonProcess.MainWindowTitle)"
+              }
+
+              foreach ($clientNumber in 1..4) {
+                  $queryStdout = Join-Path $testRoot "query-$clientNumber.stdout"
+                  $queryStderr = Join-Path $testRoot "query-$clientNumber.stderr"
+                  $queryProcess = Start-Process -FilePath $incant `
+                      -ArgumentList @('--pipe', 'release-e2e-query') `
+                      -RedirectStandardOutput $queryStdout `
+                      -RedirectStandardError $queryStderr `
+                      -PassThru
+                  $queryProcesses.Add([pscustomobject]@{
+                      Process = $queryProcess
+                      Stdout = $queryStdout
+                      Stderr = $queryStderr
+                  })
+              }
+              foreach ($queryClient in $queryProcesses) {
+                  if (-not $queryClient.Process.WaitForExit(30000)) {
+                      throw "concurrent named-pipe client $($queryClient.Process.Id) exceeded 30s."
+                  }
+                  $queryStdout = (Get-Content -LiteralPath $queryClient.Stdout -Raw).Trim()
+                  $queryStderr = (Get-Content -LiteralPath $queryClient.Stderr -Raw).Trim()
+                  if ($queryClient.Process.ExitCode -ne 0 -or $queryStdout -cne 'echo release-e2e') {
+                      throw "concurrent named-pipe query failed: stdout=$queryStdout stderr=$queryStderr"
+                  }
               }
               $stop = Invoke-IncantBounded -Arguments @('daemon', 'stop')
               if ($stop.ExitCode -ne 0 -or $stop.Stdout -cne 'Daemon stopped') {
@@ -579,10 +766,10 @@ jobs:
                   -ConfigDir $configDir `
                   -ProfilePath $profilePath
               if ($LASTEXITCODE -notin @(0, $null)) {
-                  throw "Published install.ps1 -Uninstall failed with status $LASTEXITCODE."
+                  throw "$proofLabel install.ps1 -Uninstall failed with status $LASTEXITCODE."
               }
               if (Test-Path -LiteralPath $incant) {
-                  throw 'Published uninstaller left incant.exe installed.'
+                  throw "$proofLabel uninstaller left incant.exe installed."
               }
               $uninstalledProfile = if (Test-Path -LiteralPath $profilePath) {
                   Get-Content -LiteralPath $profilePath -Raw
@@ -592,16 +779,19 @@ jobs:
               }
               if ($uninstalledProfile.Contains($profileStartMarker) -or
                   $uninstalledProfile.Contains($profileEndMarker)) {
-                  throw 'Published uninstaller left the owned PowerShell profile block installed.'
+                  throw "$proofLabel uninstaller left the owned PowerShell profile block installed."
               }
               if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-                  throw 'Published uninstaller removed config.toml without -RemoveConfig.'
+                  throw "$proofLabel uninstaller removed config.toml without -RemoveConfig."
               }
               $configHashAfter = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
               if ($configHashAfter -cne $configHashBefore) {
-                  throw 'Published uninstaller modified config.toml.'
+                  throw "$proofLabel uninstaller modified config.toml."
               }
               $uninstallCompleted = $true
+          }
+          catch {
+              $primaryFailure = $_
           }
           finally {
               $cleanupFailures = [Collections.Generic.List[string]]::new()
@@ -639,6 +829,19 @@ jobs:
                       $cleanupFailures.Add($_.Exception.Message)
                   }
               }
+              foreach ($queryClient in $queryProcesses) {
+                  if (-not $queryClient.Process.HasExited) {
+                      try {
+                          Stop-Process -Id $queryClient.Process.Id -Force -ErrorAction Stop
+                          if (-not $queryClient.Process.WaitForExit(5000)) {
+                              throw "query client $($queryClient.Process.Id) did not exit within 5 seconds."
+                          }
+                      }
+                      catch {
+                          $cleanupFailures.Add("query client cleanup failed: $($_.Exception.Message)")
+                      }
+                  }
+              }
               if ($null -ne $mock -and -not $mock.HasExited) {
                   try {
                       Stop-Process -Id $mock.Id -Force -ErrorAction Stop
@@ -650,6 +853,17 @@ jobs:
                       $cleanupFailures.Add("mock Ollama cleanup failed: $($_.Exception.Message)")
                   }
               }
+              if ($null -ne $asset -and -not $asset.HasExited) {
+                  try {
+                      Stop-Process -Id $asset.Id -Force -ErrorAction Stop
+                      if (-not $asset.WaitForExit(5000)) {
+                          throw 'candidate asset server did not exit within 5 seconds.'
+                      }
+                  }
+                  catch {
+                      $cleanupFailures.Add("candidate asset server cleanup failed: $($_.Exception.Message)")
+                  }
+              }
               try {
                   if (Test-Path -LiteralPath $testRoot) {
                       Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction Stop
@@ -659,6 +873,182 @@ jobs:
                   $cleanupFailures.Add("temporary owned-state cleanup failed: $($_.Exception.Message)")
               }
               if ($cleanupFailures.Count -ne 0) {
-                  throw "Release E2E cleanup failed: $($cleanupFailures -join '; ')"
+                  $cleanupMessage = $cleanupFailures -join '; '
+                  if ($null -ne $primaryFailure) {
+                      throw "Release E2E failed: $($primaryFailure.Exception.Message); cleanup also failed: $cleanupMessage"
+                  }
+                  throw "Release E2E cleanup failed: $cleanupMessage"
               }
           }
+          if ($null -ne $primaryFailure) {
+              throw $primaryFailure
+          }
+
+  publish-prerelease:
+    name: publish verified prerelease
+    needs: [validate-tag, assemble, provenance, verify-windows-candidate]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-manifest
+          path: dist
+      - name: Create hidden draft and expose it as a prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; refusing to replace it" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz \
+            dist/*.zip \
+            dist/*.cdx.json \
+            dist/*.spdx.json \
+            dist/install.ps1 \
+            dist/SHA256SUMS \
+            --draft \
+            --verify-tag \
+            --title "Incant $GITHUB_REF_NAME" \
+            --generate-notes \
+            --repo "$GITHUB_REPOSITORY"
+          gh release edit "$GITHUB_REF_NAME" \
+            --draft=false \
+            --prerelease \
+            --latest=false \
+            --repo "$GITHUB_REPOSITORY"
+
+  verify-windows-release:
+    name: verify public prerelease (${{ matrix.target }})
+    needs: [validate-tag, publish-prerelease]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      INCANT_RELEASE_VERSION: ${{ needs.validate-tag.outputs.version }}
+      INCANT_RELEASE_TARGET: ${{ matrix.target }}
+      INCANT_E2E_SOURCE: public
+    steps: *windows-release-e2e
+
+  verify-release-attestations:
+    name: verify public assets and attestations
+    needs: [publish-prerelease]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download and verify the complete public asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          gh release download "$GITHUB_REF_NAME" \
+            --dir dist \
+            --repo "$GITHUB_REPOSITORY"
+          version="${GITHUB_REF_NAME#v}"
+          expected=(
+            "incant-$version-aarch64-apple-darwin.cdx.json"
+            "incant-$version-aarch64-apple-darwin.spdx.json"
+            "incant-$version-aarch64-apple-darwin.tar.gz"
+            "incant-$version-aarch64-pc-windows-msvc.cdx.json"
+            "incant-$version-aarch64-pc-windows-msvc.spdx.json"
+            "incant-$version-aarch64-pc-windows-msvc.zip"
+            "incant-$version-aarch64-unknown-linux-gnu.cdx.json"
+            "incant-$version-aarch64-unknown-linux-gnu.spdx.json"
+            "incant-$version-aarch64-unknown-linux-gnu.tar.gz"
+            "incant-$version-x86_64-apple-darwin.cdx.json"
+            "incant-$version-x86_64-apple-darwin.spdx.json"
+            "incant-$version-x86_64-apple-darwin.tar.gz"
+            "incant-$version-x86_64-pc-windows-msvc.cdx.json"
+            "incant-$version-x86_64-pc-windows-msvc.spdx.json"
+            "incant-$version-x86_64-pc-windows-msvc.zip"
+            "incant-$version-x86_64-unknown-linux-gnu.cdx.json"
+            "incant-$version-x86_64-unknown-linux-gnu.spdx.json"
+            "incant-$version-x86_64-unknown-linux-gnu.tar.gz"
+            "install.ps1"
+            "SHA256SUMS"
+          )
+          mapfile -t actual < <(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
+          if [[ "${actual[*]}" != "${wanted[*]}" ]]; then
+            printf 'expected assets:\n%s\nactual assets:\n%s\n' \
+              "${wanted[*]}" "${actual[*]}" >&2
+            exit 1
+          fi
+          (
+            cd dist
+            sha256sum --check --strict SHA256SUMS
+          )
+          for asset in "${expected[@]}"; do
+            gh attestation verify "dist/$asset" --repo "$GITHUB_REPOSITORY"
+          done
+
+  promote:
+    name: promote verified release
+    needs: [verify-windows-release, verify-release-attestations]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Promote verified prerelease
+        run: >-
+          gh release edit "$GITHUB_REF_NAME"
+          --prerelease=false
+          --latest
+          --repo "$GITHUB_REPOSITORY"
+
+  rollback-release:
+    name: remove failed prerelease
+    needs:
+      - publish-prerelease
+      - verify-windows-release
+      - verify-release-attestations
+      - promote
+    if: >-
+      always() &&
+      needs.publish-prerelease.result == 'success' &&
+      needs.promote.result != 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Delete the unverified release and tag
+        shell: bash
+        run: |
+          set +e
+          cleanup_status=0
+          gh release delete "$GITHUB_REF_NAME" --yes --repo "$GITHUB_REPOSITORY" || cleanup_status=1
+          gh api \
+            --method DELETE \
+            "repos/$GITHUB_REPOSITORY/git/refs/tags/$GITHUB_REF_NAME" || cleanup_status=1
+          echo "::warning::A failed prerelease was removed, but already-fetched CDN responses may remain cached temporarily."
+          exit "$cleanup_status"
