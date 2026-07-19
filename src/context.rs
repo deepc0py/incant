@@ -249,7 +249,7 @@ $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adminis
     }
     let text = String::from_utf8(output.stdout).context("PowerShell returned non-UTF-8 context")?;
     let parsed = parse_windows_context(&text, diagnostic_tools)?;
-    let shell = normalize_windows_shell(&parsed.0, std::env::var_os("COMSPEC").as_deref());
+    let shell = normalize_windows_shell(&parsed.0)?;
     Ok((shell, Some(parsed.1)))
 }
 
@@ -330,38 +330,23 @@ fn windows_process_stem(name: &str) -> &str {
 }
 
 #[cfg(any(windows, test))]
-fn normalize_windows_shell(parent_name: &str, comspec: Option<&std::ffi::OsStr>) -> String {
+fn normalize_windows_shell(parent_name: &str) -> Result<String> {
     let parent = windows_process_stem(parent_name);
+    if parent.is_empty() {
+        bail!("PowerShell returned an empty parent process name; active Windows shell is unknown");
+    }
     if parent.eq_ignore_ascii_case("pwsh") {
-        return "pwsh".to_string();
+        return Ok("pwsh".to_string());
     }
     if parent.eq_ignore_ascii_case("powershell") {
-        return "PowerShell".to_string();
+        return Ok("PowerShell".to_string());
     }
     if parent.eq_ignore_ascii_case("cmd") {
-        return "cmd".to_string();
+        return Ok("cmd".to_string());
     }
-    if parent.is_empty() {
-        return comspec
-            .and_then(std::ffi::OsStr::to_str)
-            .map(windows_process_stem)
-            .map_or_else(String::new, normalize_observed_windows_shell);
-    }
-    parent.to_string()
+    Ok(parent.to_string())
 }
 
-#[cfg(any(windows, test))]
-fn normalize_observed_windows_shell(shell: &str) -> String {
-    if shell.eq_ignore_ascii_case("pwsh") {
-        "pwsh".to_string()
-    } else if shell.eq_ignore_ascii_case("powershell") {
-        "PowerShell".to_string()
-    } else if shell.eq_ignore_ascii_case("cmd") {
-        "cmd".to_string()
-    } else {
-        shell.to_string()
-    }
-}
 /// Git state of `dir`: branch plus dirty/clean, e.g. "branch main, dirty".
 ///
 /// One `git status --porcelain=v2 --branch -uno` call yields both facts.
@@ -605,21 +590,26 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_supported_windows_shells_without_shell_environment_fallback() {
-        let cmd = Some(std::ffi::OsStr::new(r"C:\Windows\System32\cmd.exe"));
+    fn normalizes_observed_windows_shells_and_rejects_an_empty_parent() {
         let cases = [
-            ("pwsh", None, "pwsh"),
-            ("PwSh.EXE", None, "pwsh"),
-            ("powershell.exe", None, "PowerShell"),
-            ("CMD.EXE", None, "cmd"),
-            ("WindowsTerminal", cmd, "WindowsTerminal"),
-            ("nu.exe", cmd, "nu"),
-            (r"C:\Tools\nu.exe", None, "nu"),
-            ("", cmd, "cmd"),
-            ("  ", None, ""),
+            ("pwsh", "pwsh"),
+            ("PwSh.EXE", "pwsh"),
+            ("powershell.exe", "PowerShell"),
+            ("CMD.EXE", "cmd"),
+            ("WindowsTerminal", "WindowsTerminal"),
+            ("nu.exe", "nu"),
+            (r"C:\Tools\nu.exe", "nu"),
         ];
-        for (parent, comspec, expected) in cases {
-            assert_eq!(normalize_windows_shell(parent, comspec), expected);
+        for (parent, expected) in cases {
+            assert_eq!(normalize_windows_shell(parent).unwrap(), expected);
+        }
+
+        for parent in ["", "  "] {
+            let error = normalize_windows_shell(parent).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                "PowerShell returned an empty parent process name; active Windows shell is unknown"
+            );
         }
     }
 

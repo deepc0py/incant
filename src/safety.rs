@@ -102,204 +102,346 @@ impl Rule {
         }
     }
 
-    fn matches(&self, command: &str) -> bool {
+    fn matches(&self, command: &str, sources: &[PowerShellSource<'_>]) -> bool {
         if !self.segment_scoped {
             return self.all.iter().all(|re| re.is_match(command))
                 && self.unless.as_ref().is_none_or(|re| !re.is_match(command));
         }
 
-        any_powershell_segment(command, |segment| {
-            let Some(primary) = self.all.first() else {
-                return false;
-            };
-            if !self.all[1..].iter().all(|re| re.is_match(segment)) {
-                return false;
-            }
+        sources.iter().any(|source| {
+            source.lex.command_starts.iter().any(|&start| {
+                let untrimmed = &source.text[start..];
+                let candidate = untrimmed.trim_start_matches(char::is_whitespace);
+                let candidate_start = start + (untrimmed.len() - candidate.len());
+                let Some(primary) = self.all.first() else {
+                    return false;
+                };
+                if !self.all[1..].iter().all(|re| re.is_match(candidate)) {
+                    return false;
+                }
 
-            primary.find_iter(segment).any(|primary_match| {
-                let invocation = powershell_invocation_scope(segment, primary_match.start());
-                self.unless
-                    .as_ref()
-                    .is_none_or(|re| !re.is_match(&mask_powershell_non_code(invocation)))
+                primary.find_iter(candidate).any(|matched| {
+                    let match_start = candidate_start + matched.start();
+                    let match_end = candidate_start + matched.end();
+                    let Some(operation_start) =
+                        source
+                            .lex
+                            .operation_start(source.text, match_start, match_end)
+                    else {
+                        return false;
+                    };
+                    let invocation_end = source.lex.invocation_end(source.text, operation_start);
+                    self.unless.as_ref().is_none_or(|unless| {
+                        !unless
+                            .find_iter(&source.text[operation_start..invocation_end])
+                            .any(|exception| {
+                                source
+                                    .lex
+                                    .operation_start(
+                                        source.text,
+                                        operation_start + exception.start(),
+                                        operation_start + exception.end(),
+                                    )
+                                    .is_some()
+                            })
+                    })
+                })
             })
         })
     }
 }
 
-/// Apply a rule to each PowerShell command segment. Separators inside quoted
-/// strings and escaped separators remain part of the current command.
-fn any_powershell_segment(command: &str, mut predicate: impl FnMut(&str) -> bool) -> bool {
-    let bytes = command.as_bytes();
-    let mut start = 0;
-    let mut index = 0;
-    let mut quote = None;
-
-    while index < bytes.len() {
-        match quote {
-            Some(b'\'') => {
-                if bytes[index] == b'\'' {
-                    if bytes.get(index + 1) == Some(&b'\'') {
-                        index += 2;
-                        continue;
-                    }
-                    quote = None;
-                }
-                index += 1;
-            }
-            Some(b'"') => {
-                if bytes[index] == b'`' && index + 1 < bytes.len() {
-                    index += 2;
-                } else {
-                    if bytes[index] == b'"' {
-                        quote = None;
-                    }
-                    index += 1;
-                }
-            }
-            Some(_) => unreachable!("only PowerShell quote bytes are stored"),
-            None => {
-                if bytes[index] == b'`' && index + 1 < bytes.len() {
-                    index += 2;
-                    continue;
-                }
-                if matches!(bytes[index], b'\'' | b'"') {
-                    quote = Some(bytes[index]);
-                    index += 1;
-                    continue;
-                }
-
-                let separator_len = match bytes[index] {
-                    b'\r' => usize::from(bytes.get(index + 1) == Some(&b'\n')) + 1,
-                    b'\n' | b';' => 1,
-                    b'&' if bytes.get(index + 1) == Some(&b'&') => 2,
-                    b'|' => usize::from(bytes.get(index + 1) == Some(&b'|')) + 1,
-                    _ => 0,
-                };
-                if separator_len == 0 {
-                    index += 1;
-                    continue;
-                }
-                if predicate(command[start..index].trim()) {
-                    return true;
-                }
-                index += separator_len;
-                start = index;
-            }
-        }
-    }
-
-    predicate(command[start..].trim())
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PowerShellNesting {
+    paren: u16,
+    brace: u16,
+    bracket: u16,
 }
 
-/// Limit an exception such as `-WhatIf` to the invocation containing the
-/// matched cmdlet. A nested `$(...)` or script block cannot borrow an outer
-/// command's common parameters.
-fn powershell_invocation_scope(segment: &str, match_start: usize) -> &str {
-    let tail = &segment[match_start..];
-    let Some((offset, opener)) = tail
-        .char_indices()
-        .find(|(_, character)| !character.is_ascii_whitespace())
-    else {
-        return tail;
-    };
-    let closer = match opener {
-        '(' => b')',
-        '{' => b'}',
-        _ => return tail,
-    };
+#[derive(Clone, Copy, Debug, Default)]
+struct PowerShellByte {
+    executable: bool,
+    invocation_quoted: bool,
+    nesting: PowerShellNesting,
+}
 
-    let bytes = tail.as_bytes();
-    let opener = opener as u8;
-    let mut depth = 0;
-    let mut quote = None;
-    let mut index = offset;
-    while index < bytes.len() {
-        match quote {
-            Some(b'\'') => {
-                if bytes[index] == b'\'' {
-                    if bytes.get(index + 1) == Some(&b'\'') {
+struct PowerShellLex {
+    bytes: Vec<PowerShellByte>,
+    command_starts: Vec<usize>,
+}
+
+struct PowerShellSource<'a> {
+    text: &'a str,
+    lex: PowerShellLex,
+}
+
+impl<'a> PowerShellSource<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            lex: PowerShellLex::new(text),
+        }
+    }
+}
+
+impl PowerShellLex {
+    /// Record which bytes are executable PowerShell and their lexical nesting.
+    /// This intentionally handles only syntax needed by the advisory rules:
+    /// strings, comments, backtick escapes, grouping, and command separators.
+    fn new(command: &str) -> Self {
+        let raw = command.as_bytes();
+        let mut bytes = vec![PowerShellByte::default(); raw.len()];
+        let mut command_starts = vec![0];
+        let mut nesting = PowerShellNesting::default();
+        let mut quote: Option<(u8, bool)> = None;
+        let mut line_comment = false;
+        let mut block_comment = false;
+        let mut index = 0;
+
+        while index < raw.len() {
+            bytes[index].nesting = nesting;
+
+            if line_comment {
+                if matches!(raw[index], b'\r' | b'\n') {
+                    line_comment = false;
+                } else {
+                    index += 1;
+                    continue;
+                }
+            }
+            if block_comment {
+                if raw[index] == b'#' && raw.get(index + 1) == Some(&b'>') {
+                    if index + 1 < bytes.len() {
+                        bytes[index + 1].nesting = nesting;
+                    }
+                    block_comment = false;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+
+            if let Some((delimiter, invocation_quoted)) = quote {
+                bytes[index].invocation_quoted = invocation_quoted;
+                if delimiter == b'\'' && raw[index] == b'\'' {
+                    if raw.get(index + 1) == Some(&b'\'') {
+                        bytes[index + 1].nesting = nesting;
+                        bytes[index + 1].invocation_quoted = invocation_quoted;
                         index += 2;
                         continue;
                     }
                     quote = None;
+                } else if delimiter == b'"' {
+                    if raw[index] == b'`' && index + 1 < raw.len() {
+                        bytes[index + 1].nesting = nesting;
+                        bytes[index + 1].invocation_quoted = invocation_quoted;
+                        index += 2;
+                        continue;
+                    }
+                    if raw[index] == b'"' {
+                        quote = None;
+                    }
                 }
+                index += 1;
+                continue;
             }
-            Some(b'"') => {
-                if bytes[index] == b'`' && index + 1 < bytes.len() {
-                    index += 2;
-                    continue;
+
+            if raw[index] == b'<' && raw.get(index + 1) == Some(&b'#') {
+                if index + 1 < bytes.len() {
+                    bytes[index + 1].nesting = nesting;
                 }
-                if bytes[index] == b'"' {
-                    quote = None;
-                }
-            }
-            Some(_) => unreachable!("only PowerShell quote bytes are stored"),
-            None if bytes[index] == b'`' && index + 1 < bytes.len() => {
+                block_comment = true;
                 index += 2;
                 continue;
             }
-            None if matches!(bytes[index], b'\'' | b'"') => quote = Some(bytes[index]),
-            None if bytes[index] == opener => depth += 1,
-            None if bytes[index] == closer => {
-                depth -= 1;
-                if depth == 0 {
-                    return &tail[..index];
-                }
+            if raw[index] == b'#' {
+                line_comment = true;
+                index += 1;
+                continue;
             }
-            None => {}
-        }
-        index += 1;
-    }
-    tail
-}
+            if raw[index] == b'`' && index + 1 < raw.len() {
+                bytes[index + 1].nesting = nesting;
+                index += 2;
+                continue;
+            }
+            if matches!(raw[index], b'\'' | b'"') {
+                let invocation_quoted =
+                    previous_executable_non_whitespace(command, &bytes, index) == Some(b'&');
+                bytes[index].invocation_quoted = invocation_quoted;
+                quote = Some((raw[index], invocation_quoted));
+                index += 1;
+                continue;
+            }
 
-/// Mask quoted strings and comments before looking for common parameters.
-/// Their text is data, not a parameter on the matched invocation.
-fn mask_powershell_non_code(command: &str) -> String {
-    let mut masked = command.as_bytes().to_vec();
-    let mut quote = None;
-    let mut index = 0;
-    while index < masked.len() {
-        match quote {
-            Some(b'\'') => {
-                if masked[index] == b'\'' {
-                    if masked.get(index + 1) == Some(&b'\'') {
-                        masked[index] = b' ';
-                        masked[index + 1] = b' ';
-                        index += 2;
-                        continue;
+            bytes[index].executable = true;
+            let separator_len = powershell_separator_len(raw, index);
+            if separator_len != 0 {
+                for offset in 1..separator_len {
+                    if index + offset < bytes.len() {
+                        bytes[index + offset].executable = true;
+                        bytes[index + offset].nesting = nesting;
                     }
-                    quote = None;
-                } else {
-                    masked[index] = b' ';
+                }
+                command_starts.push(index + separator_len);
+                index += separator_len;
+                continue;
+            }
+
+            match raw[index] {
+                b'(' => {
+                    nesting.paren = nesting.paren.saturating_add(1);
+                    command_starts.push(index + 1);
+                }
+                b')' => nesting.paren = nesting.paren.saturating_sub(1),
+                b'{' => {
+                    nesting.brace = nesting.brace.saturating_add(1);
+                    command_starts.push(index + 1);
+                }
+                b'}' => nesting.brace = nesting.brace.saturating_sub(1),
+                b'[' => nesting.bracket = nesting.bracket.saturating_add(1),
+                b']' => nesting.bracket = nesting.bracket.saturating_sub(1),
+                _ => {}
+            }
+            index += 1;
+        }
+
+        command_starts.sort_unstable();
+        command_starts.dedup();
+        Self {
+            bytes,
+            command_starts,
+        }
+    }
+
+    /// Locate the operation token in a regex match. Tokens in ordinary strings
+    /// or comments are inert; a quoted executable immediately invoked by `&`
+    /// is executable code.
+    fn operation_start(&self, command: &str, start: usize, end: usize) -> Option<usize> {
+        let raw = command.as_bytes();
+        (start..end.min(self.bytes.len())).find(|&index| {
+            let byte = self.bytes[index];
+            let token_byte = raw[index];
+            (byte.executable || byte.invocation_quoted)
+                && (token_byte.is_ascii_alphanumeric() || matches!(token_byte, b'_' | b'-'))
+        })
+    }
+
+    /// End the matched invocation at a separator at the operation's nesting
+    /// depth, or at the delimiter that exits its containing scope.
+    fn invocation_end(&self, command: &str, operation_start: usize) -> usize {
+        let nesting = self.bytes[operation_start].nesting;
+        let raw = command.as_bytes();
+        let mut index = operation_start;
+        while index < self.bytes.len() {
+            let byte = self.bytes[index];
+            if !byte.executable {
+                index += 1;
+                continue;
+            }
+            if byte.nesting == nesting && matches!(raw[index], b'\r' | b'\n' | b';' | b'|') {
+                return index;
+            }
+            if byte.nesting == nesting && raw[index] == b'&' && raw.get(index + 1) == Some(&b'&') {
+                return index;
+            }
+            if (raw[index] == b')' && nesting.paren > 0 && byte.nesting.paren == nesting.paren)
+                || (raw[index] == b'}' && nesting.brace > 0 && byte.nesting.brace == nesting.brace)
+                || (raw[index] == b']'
+                    && nesting.bracket > 0
+                    && byte.nesting.bracket == nesting.bracket)
+            {
+                return index;
+            }
+            index += 1;
+        }
+        self.bytes.len()
+    }
+}
+
+fn previous_executable_non_whitespace(
+    command: &str,
+    bytes: &[PowerShellByte],
+    before: usize,
+) -> Option<u8> {
+    (0..before).rev().find_map(|index| {
+        let raw = command.as_bytes()[index];
+        (bytes[index].executable && !raw.is_ascii_whitespace()).then_some(raw)
+    })
+}
+
+fn powershell_separator_len(raw: &[u8], index: usize) -> usize {
+    match raw[index] {
+        b'\r' => usize::from(raw.get(index + 1) == Some(&b'\n')) + 1,
+        b'\n' | b';' => 1,
+        b'&' if raw.get(index + 1) == Some(&b'&') => 2,
+        b'|' => usize::from(raw.get(index + 1) == Some(&b'|')) + 1,
+        _ => 0,
+    }
+}
+
+static NESTED_POWERSHELL_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(?:pwsh|powershell)(?:\.exe)?\b[^\r\n|;]*?-(?:command|c)\s+(?<quote>['"])"#)
+        .expect("static nested PowerShell pattern must compile")
+});
+
+fn powershell_sources(command: &str) -> Vec<PowerShellSource<'_>> {
+    let mut pending = vec![command];
+    let mut sources = Vec::new();
+    let mut index = 0;
+
+    while index < pending.len() {
+        let text = pending[index];
+        let source = PowerShellSource::new(text);
+        if pending.len() < 16 {
+            for payload in nested_powershell_payloads(text, &source.lex) {
+                let duplicate = pending.iter().any(|known| {
+                    known.as_ptr() == payload.as_ptr() && known.len() == payload.len()
+                });
+                if !duplicate {
+                    pending.push(payload);
                 }
             }
-            Some(b'"') => {
-                if masked[index] == b'`' && index + 1 < masked.len() {
-                    masked[index] = b' ';
-                    masked[index + 1] = b' ';
-                    index += 2;
-                    continue;
-                }
-                if masked[index] == b'"' {
-                    quote = None;
-                } else {
-                    masked[index] = b' ';
-                }
-            }
-            Some(_) => unreachable!("only PowerShell quote bytes are stored"),
-            None if masked[index] == b'#' => {
-                masked[index..].fill(b' ');
-                break;
-            }
-            None if matches!(masked[index], b'\'' | b'"') => quote = Some(masked[index]),
-            None => {}
+        }
+        sources.push(source);
+        index += 1;
+    }
+    sources
+}
+
+fn nested_powershell_payloads<'a>(command: &'a str, lex: &PowerShellLex) -> Vec<&'a str> {
+    NESTED_POWERSHELL_COMMAND
+        .captures_iter(command)
+        .filter_map(|captures| {
+            let matched = captures.get(0)?;
+            lex.operation_start(command, matched.start(), matched.end())?;
+            let quote = captures.name("quote")?;
+            let end = powershell_quote_end(command, quote.start())?;
+            Some(&command[quote.end()..end])
+        })
+        .collect()
+}
+
+fn powershell_quote_end(command: &str, quote_start: usize) -> Option<usize> {
+    let raw = command.as_bytes();
+    let quote = *raw.get(quote_start)?;
+    let mut index = quote_start + 1;
+    while index < raw.len() {
+        if quote == b'\'' && raw[index] == b'\'' && raw.get(index + 1) == Some(&b'\'') {
+            index += 2;
+            continue;
+        }
+        if quote == b'"' && raw[index] == b'`' && index + 1 < raw.len() {
+            index += 2;
+            continue;
+        }
+        if raw[index] == quote {
+            return Some(index);
         }
         index += 1;
     }
-    String::from_utf8(masked).expect("masking ASCII bytes preserves UTF-8")
+    None
 }
-
 // Building blocks reused across rm/chmod rules.
 //
 // "Broad target" = an argument that expands to the filesystem root, the home
@@ -665,9 +807,10 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
 /// Every matching rule becomes a [`Finding`]; the overall level is the most
 /// severe finding (or [`RiskLevel::Safe`] when nothing matches).
 pub fn assess(command: &str) -> Assessment {
+    let sources = powershell_sources(command);
     let mut findings: Vec<Finding> = RULES
         .iter()
-        .filter(|rule| rule.matches(command))
+        .filter(|rule| rule.matches(command, &sources))
         .map(|rule| Finding {
             rule: rule.id.to_string(),
             level: rule.level,
@@ -675,7 +818,6 @@ pub fn assess(command: &str) -> Assessment {
         })
         .collect();
 
-    // Most severe first, so clients can print findings in order.
     findings.sort_by_key(|f| std::cmp::Reverse(f.level));
 
     let level = findings.first().map(|f| f.level).unwrap_or(RiskLevel::Safe);
@@ -1409,5 +1551,47 @@ mod tests {
                 "{command:?} must remain non-destructive"
             );
         }
+    }
+    #[test]
+    fn powershell_lexer_rejects_inert_text_and_scopes_nested_whatif() {
+        for command in [
+            "Write-Output 'pnputil.exe /delete-driver oem42.inf /uninstall'",
+            "Write-Output 'netsh winsock reset'",
+            "Write-Output 'bcdedit.exe /deletevalue {current} safeboot'",
+            "Write-Output 'pwsh.exe -EncodedCommand SQBFAFgA'",
+            "'diagnostic; Stop-Service Spooler'",
+            "# Stop-Service Spooler\r\nGet-Service Spooler",
+            "Write-Output \"diagnostic `\"Stop-Service Spooler`\"\"",
+            "<# Stop-Service Spooler #> Get-Service Spooler",
+            "Write-Output \"pwsh -Command 'Stop-Service Spooler'\"",
+            "pwsh -Command 'Stop-Service Spooler -WhatIf'",
+        ] {
+            assert_safe(command);
+        }
+
+        for command in [
+            "& { param([switch]$WhatIf) Get-Date; Stop-Service Spooler } -WhatIf",
+            "& { Get-Date | Stop-Service Spooler } -WhatIf",
+            "Get-Date\r\nStop-Service Spooler",
+            "Remove-Item -Path 'HKLM:\\Software\\Incant' -Recurse",
+            "& 'pnputil.exe' /delete-driver oem42.inf /uninstall",
+            "pwsh -NoProfile -Command 'Stop-Service Spooler'",
+        ] {
+            assert_eq!(
+                assess(command).level,
+                RiskLevel::Destructive,
+                "{command:?} must remain destructive"
+            );
+        }
+
+        assert_not_rule(
+            "& { Get-Date; Stop-Service Spooler -WhatIf } -WhatIf:$false",
+            "powershell-service-change",
+        );
+        assert_flags(
+            "& { Get-Date; Stop-Service Spooler -WhatIf:$false } -WhatIf",
+            "powershell-service-change",
+            RiskLevel::Destructive,
+        );
     }
 }
