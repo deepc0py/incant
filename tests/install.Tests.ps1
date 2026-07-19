@@ -307,6 +307,23 @@ Describe 'install.ps1' {
         $script:FakeUserPath | Should -Be $script:ExistingPath
     }
 
+    It 'fails without reporting success when requested config removal leaves the file behind' {
+        $configPath = Join-Path $script:ConfigDir 'config.toml'
+        New-Item -ItemType Directory -Path $script:ConfigDir -Force | Out-Null
+        Set-Content -LiteralPath $configPath -Value 'user setting'
+        Mock Remove-Item {} -ParameterFilter { $LiteralPath -eq $configPath }
+
+        {
+            Invoke-IncantInstaller -Uninstall -RemoveConfig -InstallDir $script:InstallDir `
+                -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath
+        } | Should -Throw "*Cannot uninstall Incant: '$configPath' still exists after removal.*"
+
+        Test-Path -LiteralPath $configPath | Should -BeTrue
+        Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter {
+            $Object -eq 'Incant uninstalled successfully.'
+        }
+    }
+
     It 'removes config only when explicitly requested' {
         Invoke-IncantInstaller -Version '1.2.3' -InstallDir $script:InstallDir `
             -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath

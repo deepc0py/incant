@@ -471,7 +471,18 @@ function Uninstall-Incant {
     Remove-IncantProfileBlock $PowerShellProfile
 
     if ($DeleteConfig) {
-        Remove-Item -LiteralPath (Join-Path $ConfigurationDirectory 'config.toml') -Force -ErrorAction SilentlyContinue
+        $configPath = Join-Path $ConfigurationDirectory 'config.toml'
+        if (Test-Path -LiteralPath $configPath) {
+            try {
+                Remove-Item -LiteralPath $configPath -Force -ErrorAction Stop
+            }
+            catch {
+                throw "Cannot uninstall Incant: failed to remove '$configPath': $($_.Exception.Message)"
+            }
+            if (Test-Path -LiteralPath $configPath) {
+                throw "Cannot uninstall Incant: '$configPath' still exists after removal."
+            }
+        }
         if ((Test-Path -LiteralPath $ConfigurationDirectory) -and
             @(Get-ChildItem -LiteralPath $ConfigurationDirectory -Force).Count -eq 0) {
             Remove-Item -LiteralPath $ConfigurationDirectory -Force
