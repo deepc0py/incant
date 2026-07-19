@@ -43,6 +43,10 @@ build_project() {
 install_binary() {
     info "Installing to $INSTALL_DIR..."
     mkdir -p "$INSTALL_DIR"
+    # Remove any existing binary first: overwriting it in place reuses the
+    # inode, and macOS caches code-signature validation per vnode — the
+    # kernel then SIGKILLs every exec of the updated binary until reboot.
+    rm -f "$INSTALL_DIR/incant"
     cp target/release/incant "$INSTALL_DIR/"
     chmod +x "$INSTALL_DIR/incant"
 
