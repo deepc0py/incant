@@ -33,7 +33,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: stable
+          toolchain: 1.88.0
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -46,7 +46,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: stable
+          toolchain: 1.88.0
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --all-targets --locked -- -D warnings
@@ -63,14 +63,14 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: stable
+          toolchain: 1.88.0
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --all-targets --locked -- -D warnings
 
-  # Proves the ARM64 MSVC linker/SDK setup on the x64 Windows runner
-  # before a release tag depends on it. A debug build is enough to
-  # surface missing target libs; release is exercised on tag.
+  # Proves every ARM64 MSVC target compiles against the runner's linker/SDK
+  # before a release tag depends on it; native execution occurs in the
+  # Windows 11 ARM release gate.
   build-windows-arm64:
     name: build (aarch64-pc-windows-msvc)
     runs-on: windows-latest
@@ -80,16 +80,16 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: stable
+          toolchain: 1.88.0
           targets: aarch64-pc-windows-msvc
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: cargo build --locked --target aarch64-pc-windows-msvc
+      - run: cargo check --locked --all-targets --target aarch64-pc-windows-msvc
 
   # Runs the Windows installer's Pester suite under pwsh 7.4+. The suite
   # lands with the installer branch; until it merges this job fails,
   # matching the dependency already accepted for the Windows test lane.
-  # windows-latest ships Pester 5; a missing module is a hard failure,
-  # never an unpinned install from the gallery.
+  # Install the exact parser/test engine version; never drift to a runner
+  # image's bundled Pester or an unpinned gallery release.
   pester-windows:
     name: pester (windows-latest)
     runs-on: windows-latest
@@ -99,21 +99,26 @@ jobs:
           persist-credentials: false
       - name: Run installer Pester suite
         shell: pwsh
+        timeout-minutes: 5
         run: |
           if ($PSVersionTable.PSVersion -lt [version] '7.4') {
               throw "pwsh 7.4+ required; runner has $($PSVersionTable.PSVersion)."
           }
-          $pester = Get-Module -ListAvailable -Name Pester |
-              Where-Object { $_.Version -ge [version] '5.0' } |
-              Sort-Object -Property Version -Descending |
-              Select-Object -First 1
-          if ($null -eq $pester) {
-              throw 'Pester 5 is not available on this runner; refusing to install an unpinned fallback.'
+          Install-Module Pester `
+              -RequiredVersion 6.0.1 `
+              -Repository PSGallery `
+              -Scope CurrentUser `
+              -Force `
+              -AllowClobber `
+              -ErrorAction Stop
+          Import-Module Pester -RequiredVersion 6.0.1 -Force -ErrorAction Stop
+          $loadedVersion = (Get-Module Pester).Version
+          if ($loadedVersion -ne [version] '6.0.1') {
+              throw "Pester 6.0.1 required; loaded $loadedVersion."
           }
-          Import-Module Pester -MinimumVersion 5.0
           $result = Invoke-Pester -Path tests/install.Tests.ps1 -Output Detailed -PassThru
-          if ($result.TotalCount -eq 0) {
-              throw 'Pester discovered no tests in tests/install.Tests.ps1.'
+          if ($result.TotalCount -ne 16) {
+              throw "Pester discovered $($result.TotalCount) tests; expected exactly 16."
           }
           if ($result.FailedCount -ne 0) {
               throw "Pester: $($result.FailedCount) of $($result.TotalCount) tests failed."
@@ -132,7 +137,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: stable
+          toolchain: 1.88.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - if: matrix.os != 'windows-latest'
         run: cargo test --locked

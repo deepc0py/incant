@@ -1,14 +1,19 @@
-# Release automation: pushing a v* tag builds binaries for six targets
-# (tarballs for Linux/macOS, zips for Windows), smoke-tests each one
-# where the runner can execute it, and publishes a GitHub Release with
-# SHA-256 checksums. Actions pinned to full commit SHAs; only the
-# publish job holds a write token.
+# Release automation: a v* tag builds six native archives, generates two
+# machine-readable SBOMs per target, publishes one verified asset set, attests
+# the aggregate SHA-256 manifest, and exercises the published Windows release.
+# Actions are pinned to full commit SHAs; write permissions are job-scoped.
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Cargo package version to build (X.Y.Z)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,8 +22,67 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate-tag:
+    name: validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.88.0
+      - name: Require requested version to equal Cargo package version
+        id: version
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              if [[ "$GITHUB_REF_NAME" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                requested_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+              else
+                echo "release tag must have exact form vX.Y.Z; got $GITHUB_REF_NAME" >&2
+                exit 1
+              fi
+              request_description="release tag $GITHUB_REF_NAME"
+              ;;
+            workflow_dispatch)
+              if [[ "$DISPATCH_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                requested_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+              else
+                echo "workflow_dispatch version must have exact form X.Y.Z; got $DISPATCH_VERSION" >&2
+                exit 1
+              fi
+              request_description="workflow_dispatch version $DISPATCH_VERSION"
+              ;;
+            *)
+              echo "unsupported release event: $GITHUB_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          cargo_version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq -er '
+                [.packages[] | select(.name == "incant") | .version] |
+                if length == 1 then .[0]
+                else error("expected exactly one Cargo package named incant")
+                end
+              '
+          )"
+          if [[ "$requested_version" != "$cargo_version" ]]; then
+            echo "$request_description does not match Cargo package version $cargo_version" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$requested_version" >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.target }})
+    needs: validate-tag
     strategy:
       fail-fast: false
       matrix:
@@ -36,13 +100,15 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
     runs-on: ${{ matrix.os }}
+    env:
+      INCANT_RELEASE_VERSION: ${{ needs.validate-tag.outputs.version }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: stable
+          toolchain: 1.88.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -71,33 +137,49 @@ jobs:
         shell: cmd
         run: target\${{ matrix.target }}\release\incant.exe --version
 
-      - name: Package (Unix)
+      - name: Install Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@b89c4df56be3261c31976d6725780e5e4c3737b # v0.24.0
+        with:
+          syft-version: v1.48.0
+
+      - name: Package and inventory (Unix)
         if: runner.os != 'Windows'
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
+          version="$INCANT_RELEASE_VERSION"
           name="incant-${version}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/incant" "$name/"
-          cp README.md LICENSE CHANGELOG.md config.example.toml "$name/"
+          cp README.md LICENSE CHANGELOG.md SECURITY.md config.example.toml "$name/"
+          "${{ steps.syft.outputs.cmd }}" "dir:$name" \
+            -o "cyclonedx-json=$name.cdx.json" \
+            -o "spdx-json=$name.spdx.json"
           tar -czf "$name.tar.gz" "$name"
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          for file in "$name.tar.gz" "$name.cdx.json" "$name.spdx.json"; do
+            shasum -a 256 "$file" > "$file.sha256"
+          done
 
-      - name: Package (Windows)
+      - name: Package and inventory (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # -creplace: strip only a lowercase 'v', matching bash's ${GITHUB_REF_NAME#v}.
-          $version = $env:GITHUB_REF_NAME -creplace '^v', ''
+          $version = $env:INCANT_RELEASE_VERSION
           $name = "incant-$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/incant.exe" -Destination $name
           Copy-Item README.md, LICENSE, CHANGELOG.md, SECURITY.md, config.example.toml -Destination $name
+          & '${{ steps.syft.outputs.cmd }}' "dir:$name" `
+              -o "cyclonedx-json=$name.cdx.json" `
+              -o "spdx-json=$name.spdx.json"
+          if ($LASTEXITCODE -ne 0) {
+              throw "Syft failed with status $LASTEXITCODE."
+          }
           Compress-Archive -Path $name -DestinationPath "$name.zip"
-          # shasum-compatible checksum line (lowercase hash, two spaces, bare
-          # file name, LF) so the Linux publish job concatenates every
-          # *.sha256 file verbatim into SHA256SUMS.
-          $hash = (Get-FileHash -Algorithm SHA256 -Path "$name.zip").Hash.ToLowerInvariant()
-          [System.IO.File]::WriteAllText("$name.zip.sha256", "$hash  $name.zip`n")
+          foreach ($file in @("$name.zip", "$name.cdx.json", "$name.spdx.json")) {
+              $hash = (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLowerInvariant()
+              [System.IO.File]::WriteAllText("$file.sha256", "$hash  $file`n")
+          }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -107,37 +189,358 @@ jobs:
             incant-*.tar.gz.sha256
             incant-*.zip
             incant-*.zip.sha256
+            incant-*.cdx.json
+            incant-*.cdx.json.sha256
+            incant-*.spdx.json
+            incant-*.spdx.json.sha256
           if-no-files-found: error
-
   publish:
     name: publish release
-    needs: build
+    needs: [validate-tag, build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
 
-      - name: Collect and verify checksums
+      - name: Collect and verify release assets
         run: |
-          cd dist
-          cat ./*.sha256 > SHA256SUMS
-          # Re-verify every downloaded archive against its build-time
-          # checksum; catches corruption or tampering in artifact
-          # transit and proves the Windows-emitted lines are
-          # shasum-parseable before anything is published.
-          shasum -a 256 --check --strict SHA256SUMS
-          rm ./*.sha256
-          cat SHA256SUMS
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(dist/*.tar.gz dist/*.zip)
+          sboms=(dist/*.cdx.json dist/*.spdx.json)
+          sidecars=(dist/*.sha256)
+          [[ ${#archives[@]} -eq 6 ]] || {
+            echo "expected 6 archives, found ${#archives[@]}" >&2
+            exit 1
+          }
+          [[ ${#sboms[@]} -eq 12 ]] || {
+            echo "expected 12 SBOMs, found ${#sboms[@]}" >&2
+            exit 1
+          }
+          [[ ${#sidecars[@]} -eq 18 ]] || {
+            echo "expected 18 checksum sidecars, found ${#sidecars[@]}" >&2
+            exit 1
+          }
+
+          cp install.ps1 dist/install.ps1
+          (
+            cd dist
+            shasum -a 256 install.ps1 > install.ps1.sha256
+            cat -- ./*.sha256 | LC_ALL=C sort > SHA256SUMS
+            [[ $(wc -l < SHA256SUMS) -eq 19 ]]
+            shasum -a 256 --check --strict SHA256SUMS
+            rm -- ./*.sha256
+          )
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-manifest
+          path: dist/SHA256SUMS
+          if-no-files-found: error
 
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.cdx.json
+            dist/*.spdx.json
+            dist/install.ps1
             dist/SHA256SUMS
+          body: |
+            ## Windows support
+
+            Incant supports Windows 10 and Windows 11 on x64 and ARM64. PowerShell 7.4 or newer is required for the installer and PSReadLine integration.
+
+            Download `install.ps1` and `SHA256SUMS`, verify the script's SHA-256 entry, then run:
+
+            ```powershell
+            pwsh -File .\install.ps1 -Version ${{ needs.validate-tag.outputs.version }}
+            ```
+
+            Generated commands are untrusted text. Review every command before pressing Enter; Incant never executes a generated command for you.
+          append_body: true
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  provenance:
+    name: attest release provenance
+    needs: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-manifest
+          path: dist
+      - uses: actions/attest-build-provenance@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+  verify-windows-release:
+    name: verify published Windows release
+    needs: [validate-tag, publish, provenance]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      INCANT_RELEASE_VERSION: ${{ needs.validate-tag.outputs.version }}
+    steps:
+      - name: Download and verify published assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist | Out-Null
+          gh release download $env:GITHUB_REF_NAME `
+              --repo $env:GITHUB_REPOSITORY `
+              --dir dist
+          if ($LASTEXITCODE -ne 0) {
+              throw "gh release download failed with status $LASTEXITCODE."
+          }
+
+          $version = $env:INCANT_RELEASE_VERSION
+          $targets = @(
+              'x86_64-unknown-linux-gnu',
+              'aarch64-unknown-linux-gnu',
+              'x86_64-apple-darwin',
+              'aarch64-apple-darwin',
+              'x86_64-pc-windows-msvc',
+              'aarch64-pc-windows-msvc'
+          )
+          $payloadNames = @()
+          foreach ($target in $targets) {
+              $base = "incant-$version-$target"
+              $payloadNames += if ($target.EndsWith('windows-msvc')) { "$base.zip" } else { "$base.tar.gz" }
+              $payloadNames += "$base.cdx.json"
+              $payloadNames += "$base.spdx.json"
+          }
+          $payloadNames += 'install.ps1'
+          $expectedNames = @($payloadNames + 'SHA256SUMS' | Sort-Object)
+          $actualNames = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object Name | Sort-Object)
+          if (@(Compare-Object $expectedNames $actualNames).Count -ne 0 -or $actualNames.Count -ne 20) {
+              throw "Published asset set mismatch. Expected 20 exact assets; found: $($actualNames -join ', ')."
+          }
+
+          $manifestLines = @(Get-Content -LiteralPath dist/SHA256SUMS)
+          if ($manifestLines.Count -ne 19) {
+              throw "SHA256SUMS must contain 19 entries; found $($manifestLines.Count)."
+          }
+          $seen = @{}
+          foreach ($line in $manifestLines) {
+              if ($line -cnotmatch '^(?<hash>[0-9a-f]{64})  (?<name>[^/\\]+)$') {
+                  throw "Malformed SHA256SUMS line: $line"
+              }
+              $name = $Matches.name
+              if ($seen.ContainsKey($name) -or $name -notin $payloadNames) {
+                  throw "Unexpected or duplicate SHA256SUMS entry: $name"
+              }
+              $seen[$name] = $true
+              $actualHash = (Get-FileHash -LiteralPath (Join-Path dist $name) -Algorithm SHA256).Hash
+              if ($actualHash -cne $Matches.hash.ToUpperInvariant()) {
+                  throw "SHA-256 mismatch for $name."
+              }
+          }
+          if ($seen.Count -ne $payloadNames.Count) {
+              throw 'SHA256SUMS does not cover every published payload.'
+          }
+
+          foreach ($sbomPath in Get-ChildItem -LiteralPath dist -Filter '*.json' -File) {
+              $sbom = Get-Content -LiteralPath $sbomPath.FullName -Raw | ConvertFrom-Json -Depth 100
+              if ($sbomPath.Name.EndsWith('.cdx.json') -and $sbom.bomFormat -cne 'CycloneDX') {
+                  throw "$($sbomPath.Name) is not a CycloneDX JSON document."
+              }
+              if ($sbomPath.Name.EndsWith('.spdx.json') -and $sbom.spdxVersion -notmatch '^SPDX-') {
+                  throw "$($sbomPath.Name) is not an SPDX JSON document."
+              }
+          }
+
+          foreach ($attestedName in @(
+              "incant-$version-x86_64-pc-windows-msvc.zip",
+              'install.ps1'
+          )) {
+              gh attestation verify (Join-Path dist $attestedName) --repo $env:GITHUB_REPOSITORY
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Provenance verification failed for $attestedName."
+              }
+          }
+
+      - name: Install and exercise the named-pipe daemon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME -creplace '^v', ''
+          $testRoot = Join-Path $env:RUNNER_TEMP 'incant-release-e2e'
+          $env:LOCALAPPDATA = Join-Path $testRoot 'local-app-data'
+          $installDir = Join-Path $env:LOCALAPPDATA 'Incant\bin'
+          $configDir = Join-Path $env:LOCALAPPDATA 'incant'
+          $profilePath = Join-Path $testRoot 'profile.ps1'
+          $mockScript = Join-Path $testRoot 'mock-ollama.ps1'
+          $mockStdout = Join-Path $testRoot 'mock-ollama.stdout'
+          $mockStderr = Join-Path $testRoot 'mock-ollama.stderr'
+          New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 11434)
+          $listener.Start()
+          try {
+              while ($true) {
+                  $client = $listener.AcceptTcpClient()
+                  try {
+                      $stream = $client.GetStream()
+                      $reader = [IO.StreamReader]::new(
+                          $stream, [Text.Encoding]::ASCII, $false, 1024, $true
+                      )
+                      $requestLine = $reader.ReadLine()
+                      $contentLength = 0
+                      while (($line = $reader.ReadLine()) -ne '') {
+                          if ($line -match '^Content-Length:\s*(\d+)$') {
+                              $contentLength = [int] $Matches[1]
+                          }
+                      }
+                      if ($contentLength -gt 0) {
+                          $bodyBuffer = [char[]]::new($contentLength)
+                          $read = 0
+                          while ($read -lt $contentLength) {
+                              $count = $reader.Read($bodyBuffer, $read, $contentLength - $read)
+                              if ($count -eq 0) { throw 'Client closed an incomplete HTTP request.' }
+                              $read += $count
+                          }
+                      }
+                      $body = if ($requestLine -like 'GET /api/tags *') {
+                          '{"models":[]}'
+                      }
+                      elseif ($requestLine -like 'POST /api/generate *') {
+                          '{"response":"echo release-e2e","done":true}'
+                      }
+                      else {
+                          '{"error":"not found"}'
+                      }
+                      $bodyBytes = [Text.Encoding]::UTF8.GetBytes($body)
+                      $headers = [Text.Encoding]::ASCII.GetBytes(
+                          "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
+                      )
+                      $stream.Write($headers)
+                      $stream.Write($bodyBytes)
+                      $stream.Flush()
+                  }
+                  finally {
+                      $client.Dispose()
+                  }
+              }
+          }
+          finally {
+              $listener.Stop()
+          }
+          '@ | Set-Content -LiteralPath $mockScript -Encoding utf8
+
+          $mock = $null
+          $incant = Join-Path $installDir 'incant.exe'
+          function Invoke-IncantBounded {
+              param(
+                  [Parameter(Mandatory)][string[]] $Arguments,
+                  [int] $TimeoutSeconds = 30
+              )
+              $stdout = [IO.Path]::GetTempFileName()
+              $stderr = [IO.Path]::GetTempFileName()
+              try {
+                  $process = Start-Process -FilePath $incant `
+                      -ArgumentList $Arguments `
+                      -RedirectStandardOutput $stdout `
+                      -RedirectStandardError $stderr `
+                      -PassThru
+                  if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+                      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                      throw "incant $($Arguments -join ' ') exceeded ${TimeoutSeconds}s."
+                  }
+                  [pscustomobject]@{
+                      ExitCode = $process.ExitCode
+                      Stdout = (Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue).Trim()
+                      Stderr = (Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue).Trim()
+                  }
+              }
+              finally {
+                  Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+              }
+          }
+
+          try {
+              & ./dist/install.ps1 -Version $version `
+                  -InstallDir $installDir `
+                  -ConfigDir $configDir `
+                  -ProfilePath $profilePath
+              if ($LASTEXITCODE -notin @(0, $null)) {
+                  throw "Published install.ps1 failed with status $LASTEXITCODE."
+              }
+
+              $versionResult = Invoke-IncantBounded -Arguments @('--version')
+              if ($versionResult.ExitCode -ne 0 -or $versionResult.Stdout -cne "incant $version") {
+                  throw "Unexpected incant --version result: $($versionResult | ConvertTo-Json -Compress)"
+              }
+
+              $mock = Start-Process -FilePath pwsh `
+                  -ArgumentList @('-NoLogo', '-NoProfile', '-File', $mockScript) `
+                  -RedirectStandardOutput $mockStdout `
+                  -RedirectStandardError $mockStderr `
+                  -PassThru
+              $ready = $false
+              foreach ($attempt in 1..20) {
+                  if ($mock.HasExited) {
+                      throw "Mock Ollama exited: $(Get-Content -LiteralPath $mockStderr -Raw)"
+                  }
+                  try {
+                      Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' `
+                          -TimeoutSec 1 | Out-Null
+                      $ready = $true
+                      break
+                  }
+                  catch {
+                      Start-Sleep -Milliseconds 100
+                  }
+              }
+              if (-not $ready) {
+                  throw 'Mock Ollama did not become ready.'
+              }
+
+              $start = Invoke-IncantBounded -Arguments @('daemon', 'start')
+              if ($start.ExitCode -ne 0) {
+                  throw "daemon start failed: $($start.Stdout) $($start.Stderr)"
+              }
+              $status = Invoke-IncantBounded -Arguments @('daemon', 'status')
+              if ($status.ExitCode -ne 0 -or $status.Stdout -cne 'Daemon is running') {
+                  throw "daemon status failed: $($status.Stdout) $($status.Stderr)"
+              }
+              $query = Invoke-IncantBounded -Arguments @('release-e2e-query')
+              if ($query.ExitCode -ne 0 -or $query.Stdout -cne 'echo release-e2e') {
+                  throw "named-pipe query mismatch: $($query.Stdout) $($query.Stderr)"
+              }
+              $stop = Invoke-IncantBounded -Arguments @('daemon', 'stop')
+              if ($stop.ExitCode -ne 0 -or $stop.Stdout -cne 'Daemon stopped') {
+                  throw "daemon stop failed: $($stop.Stdout) $($stop.Stderr)"
+              }
+          }
+          finally {
+              if (Test-Path -LiteralPath $incant) {
+                  Invoke-IncantBounded -Arguments @('daemon', 'stop') -TimeoutSeconds 10 | Out-Null
+              }
+              if ($null -ne $mock -and -not $mock.HasExited) {
+                  Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue
+              }
+              Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
