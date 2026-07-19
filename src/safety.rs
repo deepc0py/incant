@@ -107,10 +107,14 @@ impl Rule {
             return self.all.iter().all(|re| re.is_match(command))
                 && self.unless.as_ref().is_none_or(|re| !re.is_match(command));
         }
+        if self.id == "powershell-encoded-command" {
+            return sources.iter().any(matches_encoded_powershell_command);
+        }
 
         sources.iter().any(|source| {
-            source.lex.command_starts.iter().any(|&start| {
-                let untrimmed = &source.text[start..];
+            source.lex.command_starts.iter().any(|&original_start| {
+                let start = source.normalized_boundary(original_start);
+                let untrimmed = &source.normalized[start..];
                 let candidate = untrimmed.trim_start_matches(char::is_whitespace);
                 let candidate_start = start + (untrimmed.len() - candidate.len());
                 let Some(primary) = self.all.first() else {
@@ -121,8 +125,13 @@ impl Rule {
                 }
 
                 primary.find_iter(candidate).any(|matched| {
-                    let match_start = candidate_start + matched.start();
-                    let match_end = candidate_start + matched.end();
+                    let normalized_start = candidate_start + matched.start();
+                    let normalized_end = candidate_start + matched.end();
+                    let Some((match_start, match_end)) =
+                        source.original_range(normalized_start, normalized_end)
+                    else {
+                        return false;
+                    };
                     let Some(operation_start) =
                         source
                             .lex
@@ -131,18 +140,28 @@ impl Rule {
                         return false;
                     };
                     let invocation_end = source.lex.invocation_end(source.text, operation_start);
+                    let normalized_operation = source.normalized_boundary(operation_start);
+                    let normalized_invocation_end = source.normalized_boundary(invocation_end);
                     self.unless.as_ref().is_none_or(|unless| {
                         !unless
-                            .find_iter(&source.text[operation_start..invocation_end])
+                            .find_iter(
+                                &source.normalized[normalized_operation..normalized_invocation_end],
+                            )
                             .any(|exception| {
-                                source
-                                    .lex
-                                    .operation_start(
-                                        source.text,
-                                        operation_start + exception.start(),
-                                        operation_start + exception.end(),
-                                    )
-                                    .is_some()
+                                let start = normalized_operation + exception.start();
+                                let end = normalized_operation + exception.end();
+                                source.original_range(start, end).is_some_and(
+                                    |(original_start, original_end)| {
+                                        source
+                                            .lex
+                                            .operation_start(
+                                                source.text,
+                                                original_start,
+                                                original_end,
+                                            )
+                                            .is_some()
+                                    },
+                                )
                             })
                     })
                 })
@@ -162,6 +181,8 @@ struct PowerShellNesting {
 struct PowerShellByte {
     executable: bool,
     invocation_quoted: bool,
+    escaped: bool,
+    separator: bool,
     nesting: PowerShellNesting,
 }
 
@@ -172,15 +193,39 @@ struct PowerShellLex {
 
 struct PowerShellSource<'a> {
     text: &'a str,
+    normalized: String,
+    normalized_offsets: Vec<usize>,
     lex: PowerShellLex,
 }
 
 impl<'a> PowerShellSource<'a> {
     fn new(text: &'a str) -> Self {
+        let lex = PowerShellLex::new(text);
+        let (normalized, normalized_offsets) = normalize_powershell_executable(text, &lex);
         Self {
             text,
-            lex: PowerShellLex::new(text),
+            normalized,
+            normalized_offsets,
+            lex,
         }
+    }
+
+    fn normalized_boundary(&self, original: usize) -> usize {
+        self.normalized_offsets
+            .partition_point(|&offset| offset < original)
+    }
+
+    fn original_range(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        if start >= end {
+            return None;
+        }
+        let original_start = *self.normalized_offsets.get(start)?;
+        let original_end = self
+            .normalized_offsets
+            .get(end - 1)
+            .copied()
+            .map(|offset| offset + 1)?;
+        Some((original_start, original_end))
     }
 }
 
@@ -236,6 +281,7 @@ impl PowerShellLex {
                     if raw[index] == b'`' && index + 1 < raw.len() {
                         bytes[index + 1].nesting = nesting;
                         bytes[index + 1].invocation_quoted = invocation_quoted;
+                        bytes[index + 1].escaped = true;
                         index += 2;
                         continue;
                     }
@@ -260,9 +306,29 @@ impl PowerShellLex {
                 index += 1;
                 continue;
             }
+            if let Some(delimiter) = powershell_here_string_opener(raw, index) {
+                let end = powershell_here_string_end(raw, index + 2, delimiter)
+                    .map_or(raw.len(), |terminator| terminator + 2);
+                for byte in &mut bytes[index..end] {
+                    byte.nesting = nesting;
+                }
+                index = end;
+                continue;
+            }
             if raw[index] == b'`' && index + 1 < raw.len() {
-                bytes[index + 1].nesting = nesting;
-                index += 2;
+                let escaped_len = if raw[index + 1] == b'\r' && raw.get(index + 2) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                for offset in 1..=escaped_len {
+                    bytes[index + offset].nesting = nesting;
+                    bytes[index + offset].escaped = true;
+                    if !matches!(raw[index + offset], b'\r' | b'\n') {
+                        bytes[index + offset].executable = true;
+                    }
+                }
+                index += escaped_len + 1;
                 continue;
             }
             if matches!(raw[index], b'\'' | b'"') {
@@ -275,13 +341,15 @@ impl PowerShellLex {
             }
 
             bytes[index].executable = true;
-            let separator_len = powershell_separator_len(raw, index);
+            let mut separator_len = powershell_separator_len(raw, index);
+            if powershell_is_background_operator(command, &bytes, &command_starts, index) {
+                separator_len = 1;
+            }
             if separator_len != 0 {
-                for offset in 1..separator_len {
-                    if index + offset < bytes.len() {
-                        bytes[index + offset].executable = true;
-                        bytes[index + offset].nesting = nesting;
-                    }
+                for offset in 0..separator_len {
+                    bytes[index + offset].executable = true;
+                    bytes[index + offset].separator = true;
+                    bytes[index + offset].nesting = nesting;
                 }
                 command_starts.push(index + separator_len);
                 index += separator_len;
@@ -339,10 +407,7 @@ impl PowerShellLex {
                 index += 1;
                 continue;
             }
-            if byte.nesting == nesting && matches!(raw[index], b'\r' | b'\n' | b';' | b'|') {
-                return index;
-            }
-            if byte.nesting == nesting && raw[index] == b'&' && raw.get(index + 1) == Some(&b'&') {
+            if byte.nesting == nesting && byte.separator {
                 return index;
             }
             if (raw[index] == b')' && nesting.paren > 0 && byte.nesting.paren == nesting.paren)
@@ -357,6 +422,89 @@ impl PowerShellLex {
         }
         self.bytes.len()
     }
+}
+fn normalize_powershell_executable(command: &str, lex: &PowerShellLex) -> (String, Vec<usize>) {
+    let raw = command.as_bytes();
+    let mut normalized = Vec::with_capacity(raw.len());
+    let mut offsets = Vec::with_capacity(raw.len());
+    for (index, &value) in raw.iter().enumerate() {
+        let byte = lex.bytes[index];
+        if value == b'`' && lex.bytes.get(index + 1).is_some_and(|next| next.escaped) {
+            continue;
+        }
+        if byte.escaped && matches!(value, b'\r' | b'\n') {
+            continue;
+        }
+        normalized.push(value);
+        offsets.push(index);
+    }
+    (
+        String::from_utf8(normalized).expect("removing ASCII escape bytes preserves UTF-8"),
+        offsets,
+    )
+}
+fn powershell_at_command_start(
+    command: &str,
+    bytes: &[PowerShellByte],
+    command_starts: &[usize],
+    index: usize,
+) -> bool {
+    let start = command_starts
+        .iter()
+        .rev()
+        .find(|&&start| start <= index)
+        .copied()
+        .unwrap_or(0);
+    !(start..index)
+        .any(|offset| bytes[offset].executable && !command.as_bytes()[offset].is_ascii_whitespace())
+}
+fn powershell_is_background_operator(
+    command: &str,
+    bytes: &[PowerShellByte],
+    command_starts: &[usize],
+    index: usize,
+) -> bool {
+    let raw = command.as_bytes();
+    raw.get(index) == Some(&b'&')
+        && raw.get(index + 1) != Some(&b'&')
+        && !powershell_at_command_start(command, bytes, command_starts, index)
+        && previous_executable_non_whitespace(command, bytes, index) != Some(b'>')
+}
+
+fn powershell_here_string_opener(raw: &[u8], index: usize) -> Option<u8> {
+    if raw.get(index) != Some(&b'@') {
+        return None;
+    }
+    let delimiter = *raw.get(index + 1)?;
+    if !matches!(delimiter, b'\'' | b'"') {
+        return None;
+    }
+    let mut cursor = index + 2;
+    while matches!(raw.get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+    matches!(raw.get(cursor), None | Some(b'\r' | b'\n')).then_some(delimiter)
+}
+
+fn powershell_here_string_end(raw: &[u8], body_start: usize, delimiter: u8) -> Option<usize> {
+    let mut line_start = body_start;
+    if raw.get(line_start) == Some(&b'\r') {
+        line_start += 1;
+    }
+    if raw.get(line_start) == Some(&b'\n') {
+        line_start += 1;
+    }
+    while line_start < raw.len() {
+        if raw.get(line_start) == Some(&delimiter)
+            && raw.get(line_start + 1) == Some(&b'@')
+            && matches!(raw.get(line_start + 2), None | Some(b'\r' | b'\n'))
+        {
+            return Some(line_start);
+        }
+        let newline = raw[line_start..].iter().position(|&byte| byte == b'\n')?;
+        line_start += newline + 1;
+    }
+    None
 }
 
 fn previous_executable_non_whitespace(
@@ -380,13 +528,6 @@ fn powershell_separator_len(raw: &[u8], index: usize) -> usize {
     }
 }
 
-static NESTED_POWERSHELL_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)(?:^|[|;{(]\s*)(?:&\s*['"]?)?(?:pwsh|powershell)(?:\.exe)?\b[^\r\n|;]*?-(?<parameter>commandwithargs|command|c)\b"#,
-    )
-    .expect("static nested PowerShell pattern must compile")
-});
-
 fn powershell_sources(command: &str) -> Vec<PowerShellSource<'_>> {
     let mut pending = vec![command];
     let mut sources = Vec::new();
@@ -396,7 +537,7 @@ fn powershell_sources(command: &str) -> Vec<PowerShellSource<'_>> {
         let text = pending[index];
         let source = PowerShellSource::new(text);
         if pending.len() < 16 {
-            let mut discovered = nested_powershell_payloads(text, &source.lex);
+            let mut discovered = nested_powershell_payloads(text, &source);
             discovered.extend(expandable_string_subexpressions(text));
             for payload in discovered {
                 let duplicate = pending.iter().any(|known| {
@@ -413,45 +554,239 @@ fn powershell_sources(command: &str) -> Vec<PowerShellSource<'_>> {
     sources
 }
 
-fn nested_powershell_payloads<'a>(command: &'a str, lex: &PowerShellLex) -> Vec<&'a str> {
-    let mut payloads = Vec::new();
-    for &start in &lex.command_starts {
-        let untrimmed = &command[start..];
-        let candidate = untrimmed.trim_start_matches(char::is_whitespace);
-        let candidate_start = start + (untrimmed.len() - candidate.len());
-        for captures in NESTED_POWERSHELL_COMMAND.captures_iter(candidate) {
-            let matched = captures.get(0).expect("the full regex match always exists");
-            let match_start = candidate_start + matched.start();
-            let match_end = candidate_start + matched.end();
-            let Some(operation_start) = lex.operation_start(command, match_start, match_end) else {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PowerShellLauncherParameter {
+    Command,
+    CommandWithArgs,
+    EncodedCommand,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PowerShellLauncherOption {
+    parameter: PowerShellLauncherParameter,
+    argument_start: usize,
+    invocation_end: usize,
+}
+
+fn nested_powershell_payloads<'a>(command: &'a str, source: &PowerShellSource<'_>) -> Vec<&'a str> {
+    powershell_launcher_options(source)
+        .into_iter()
+        .filter_map(|option| {
+            matches!(
+                option.parameter,
+                PowerShellLauncherParameter::Command | PowerShellLauncherParameter::CommandWithArgs
+            )
+            .then(|| {
+                powershell_launcher_payload(command, option.argument_start, option.invocation_end)
+            })
+            .flatten()
+        })
+        .collect()
+}
+
+fn powershell_launcher_payload(
+    command: &str,
+    argument_start: usize,
+    invocation_end: usize,
+) -> Option<&str> {
+    if matches!(command.as_bytes()[argument_start], b'\'' | b'"') {
+        let end = powershell_quote_end(command, argument_start)?;
+        (end <= invocation_end).then_some(&command[argument_start + 1..end])
+    } else {
+        Some(command[argument_start..invocation_end].trim_end())
+    }
+}
+
+fn powershell_launcher_options(source: &PowerShellSource<'_>) -> Vec<PowerShellLauncherOption> {
+    let mut options = Vec::new();
+    for &start in &source.lex.command_starts {
+        let Some((operation_start, mut cursor)) = powershell_launcher_start(source, start) else {
+            continue;
+        };
+        let invocation_end = source.lex.invocation_end(source.text, operation_start);
+        while cursor < invocation_end {
+            cursor = skip_powershell_whitespace(source.text, cursor, invocation_end);
+            if cursor >= invocation_end {
+                break;
+            }
+            let token_start = cursor;
+            while cursor < invocation_end {
+                let byte = source.lex.bytes[cursor];
+                let raw = source.text.as_bytes()[cursor];
+                if raw == b'`'
+                    && source
+                        .lex
+                        .bytes
+                        .get(cursor + 1)
+                        .is_some_and(|next| next.escaped)
+                {
+                    cursor += 2;
+                    continue;
+                }
+                if !byte.executable || raw.is_ascii_whitespace() {
+                    break;
+                }
+                cursor += 1;
+            }
+            if cursor == token_start {
+                cursor += 1;
+                continue;
+            }
+            let normalized_start = source.normalized_boundary(token_start);
+            let normalized_end = source.normalized_boundary(cursor);
+            let token = &source.normalized[normalized_start..normalized_end];
+            let Some(parameter) = token
+                .strip_prefix('-')
+                .and_then(resolve_powershell_launcher_parameter)
+            else {
                 continue;
             };
-            let parameter = captures
-                .name("parameter")
-                .expect("the parameter capture always exists");
-            let mut argument_start = candidate_start + parameter.end();
-            let invocation_end = lex.invocation_end(command, operation_start);
-            while argument_start < invocation_end
-                && command.as_bytes()[argument_start].is_ascii_whitespace()
-            {
-                argument_start += 1;
+            let argument_start = skip_powershell_whitespace(source.text, cursor, invocation_end);
+            if argument_start < invocation_end {
+                options.push(PowerShellLauncherOption {
+                    parameter,
+                    argument_start,
+                    invocation_end,
+                });
             }
-            if argument_start >= invocation_end {
-                continue;
-            }
-
-            if matches!(command.as_bytes()[argument_start], b'\'' | b'"') {
-                if let Some(end) = powershell_quote_end(command, argument_start) {
-                    if end <= invocation_end {
-                        payloads.push(&command[argument_start + 1..end]);
-                    }
-                }
-            } else {
-                payloads.push(command[argument_start..invocation_end].trim_end());
-            }
+            break;
         }
     }
-    payloads
+    options
+}
+
+fn powershell_launcher_start(
+    source: &PowerShellSource<'_>,
+    start: usize,
+) -> Option<(usize, usize)> {
+    let limit = source.text.len();
+    let mut cursor = skip_powershell_whitespace(source.text, start, limit);
+    if source.text.as_bytes().get(cursor) == Some(&b'&') && !source.lex.bytes[cursor].separator {
+        cursor = skip_powershell_whitespace(source.text, cursor + 1, limit);
+    }
+    let operation_start = cursor;
+    let (token_start, token_end) =
+        if matches!(source.text.as_bytes().get(cursor), Some(b'\'' | b'"')) {
+            if !source.lex.bytes[cursor].invocation_quoted {
+                return None;
+            }
+            let end = powershell_quote_end(source.text, cursor)?;
+            (cursor + 1, end)
+        } else {
+            let start = cursor;
+            while cursor < limit {
+                let byte = source.lex.bytes[cursor];
+                let raw = source.text.as_bytes()[cursor];
+                if raw == b'`'
+                    && source
+                        .lex
+                        .bytes
+                        .get(cursor + 1)
+                        .is_some_and(|next| next.escaped)
+                {
+                    cursor += 2;
+                    continue;
+                }
+                if !byte.executable || raw.is_ascii_whitespace() || byte.separator {
+                    break;
+                }
+                cursor += 1;
+            }
+            (start, cursor)
+        };
+    let normalized_start = source.normalized_boundary(token_start);
+    let normalized_end = source.normalized_boundary(token_end);
+    let executable = &source.normalized[normalized_start..normalized_end];
+    is_powershell_executable(executable).then_some((
+        operation_start,
+        token_end
+            + usize::from(
+                source
+                    .text
+                    .as_bytes()
+                    .get(token_end)
+                    .is_some_and(|byte| matches!(byte, b'\'' | b'"')),
+            ),
+    ))
+}
+
+fn is_powershell_executable(token: &str) -> bool {
+    let basename = token
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(token)
+        .trim_end_matches(['\'', '"']);
+    basename.eq_ignore_ascii_case("pwsh")
+        || basename.eq_ignore_ascii_case("pwsh.exe")
+        || basename.eq_ignore_ascii_case("powershell")
+        || basename.eq_ignore_ascii_case("powershell.exe")
+}
+
+fn skip_powershell_whitespace(command: &str, mut cursor: usize, limit: usize) -> usize {
+    while cursor < limit && command.as_bytes()[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn resolve_powershell_launcher_parameter(value: &str) -> Option<PowerShellLauncherParameter> {
+    if value.eq_ignore_ascii_case("c") {
+        return Some(PowerShellLauncherParameter::Command);
+    }
+    if value.eq_ignore_ascii_case("cwa") {
+        return Some(PowerShellLauncherParameter::CommandWithArgs);
+    }
+    if ["e", "ec", "enc"]
+        .iter()
+        .any(|alias| value.eq_ignore_ascii_case(alias))
+    {
+        return Some(PowerShellLauncherParameter::EncodedCommand);
+    }
+
+    const PARAMETERS: &[&str] = &[
+        "command",
+        "configurationfile",
+        "custompipename",
+        "encodedcommand",
+        "executionpolicy",
+        "file",
+        "help",
+        "inputformat",
+        "interactive",
+        "login",
+        "mta",
+        "noexit",
+        "nologo",
+        "noninteractive",
+        "noprofile",
+        "noprofileloadtime",
+        "outputformat",
+        "settingsfile",
+        "sshservermode",
+        "sta",
+        "version",
+        "windowstyle",
+        "workingdirectory",
+    ];
+    let value = value.to_ascii_lowercase();
+    let mut matches = PARAMETERS
+        .iter()
+        .copied()
+        .filter(|parameter| parameter.starts_with(&value));
+    let parameter = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    match parameter {
+        "command" => Some(PowerShellLauncherParameter::Command),
+        "encodedcommand" => Some(PowerShellLauncherParameter::EncodedCommand),
+        _ => None,
+    }
+}
+fn matches_encoded_powershell_command(source: &PowerShellSource<'_>) -> bool {
+    powershell_launcher_options(source)
+        .iter()
+        .any(|option| option.parameter == PowerShellLauncherParameter::EncodedCommand)
 }
 
 fn powershell_quote_end(command: &str, quote_start: usize) -> Option<usize> {
@@ -528,6 +863,11 @@ fn expandable_string_subexpressions(command: &str) -> Vec<&str> {
             }
             Some(_) => unreachable!("only PowerShell quote bytes are stored"),
             None => {
+                if let Some(delimiter) = powershell_here_string_opener(raw, index) {
+                    index = powershell_here_string_end(raw, index + 2, delimiter)
+                        .map_or(raw.len(), |terminator| terminator + 2);
+                    continue;
+                }
                 if raw[index] == b'<' && raw.get(index + 1) == Some(&b'#') {
                     block_comment = true;
                     index += 2;
@@ -600,6 +940,11 @@ fn powershell_subexpression_end(command: &str, open_paren: usize) -> Option<usiz
             }
             Some(_) => unreachable!("only PowerShell quote bytes are stored"),
             None => {
+                if let Some(delimiter) = powershell_here_string_opener(raw, index) {
+                    index = powershell_here_string_end(raw, index + 2, delimiter)
+                        .map_or(raw.len(), |terminator| terminator + 2);
+                    continue;
+                }
                 if raw[index] == b'<' && raw.get(index + 1) == Some(&b'#') {
                     block_comment = true;
                     index += 2;
@@ -1862,6 +2207,120 @@ mod tests {
         ];
         for (command, rule) in benign {
             assert_not_rule(command, rule);
+        }
+    }
+    #[test]
+    fn powershell_backtick_escapes_are_normalized_only_in_executable_code() {
+        for command in [
+            "Stop`-Service Spooler",
+            "sToP`-sErViCe Spooler",
+            "Write-Output \"$(Stop`-Service Spooler)\"",
+            "pwsh -Com 'Stop`-Service Spooler'",
+        ] {
+            assert_flags(command, "powershell-service-change", RiskLevel::Destructive);
+        }
+
+        for command in [
+            "Write-Output \"Stop`-Service Spooler\"",
+            "Write-Output \"`$(Stop`-Service Spooler)\"",
+            "Write-Output 'Stop`-Service Spooler'",
+            "& 'Stop`-Service' Spooler",
+        ] {
+            assert_not_rule(command, "powershell-service-change");
+        }
+    }
+
+    #[test]
+    fn powershell_launcher_paths_and_unambiguous_parameters_are_parsed() {
+        for command in [
+            "pwsh -Com Stop-Service Spooler",
+            "PoWeRsHeLl.ExE -COMMAND Stop-Service Spooler",
+            "pwsh -Cwa { Stop-Service Spooler } ignored",
+            "& 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' -Com 'Stop-Service Spooler'",
+            "& \"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -C Stop-Service Spooler",
+        ] {
+            assert_flags(command, "powershell-service-change", RiskLevel::Destructive);
+        }
+
+        for command in [
+            "pwsh -Co Stop-Service Spooler",
+            "pwsh -CommandText Stop-Service Spooler",
+            "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Com 'Stop-Service Spooler'",
+            "& 'C:\\Tools\\not-pwsh.exe' -Com 'Stop-Service Spooler'",
+        ] {
+            assert_not_rule(command, "powershell-service-change");
+        }
+    }
+
+    #[test]
+    fn powershell_background_operator_scopes_whatif_without_breaking_call_operator() {
+        for command in [
+            "Stop-Service Spooler & Get-Service -WhatIf",
+            "Get-Date & Stop-Service Spooler",
+            "& Stop-Service Spooler",
+        ] {
+            assert_flags(command, "powershell-service-change", RiskLevel::Destructive);
+        }
+
+        for command in [
+            "Get-Date & Stop-Service Spooler -WhatIf",
+            "Stop-Service Spooler -WhatIf & Get-Service",
+            "& Stop-Service Spooler -WhatIf",
+            "Write-Output diagnostic 2>&1",
+            "Stop-Service Spooler -WhatIf 2>&1",
+        ] {
+            assert_not_rule(command, "powershell-service-change");
+        }
+    }
+
+    #[test]
+    fn encoded_command_accepts_only_powershell_parameter_prefixes() {
+        for parameter in ["-e", "-EC", "-enc", "-enco", "-encoded", "-EncodedCommand"] {
+            assert_flags(
+                &format!("pwsh {parameter} SQBFAFgA"),
+                "powershell-encoded-command",
+                RiskLevel::Caution,
+            );
+        }
+        assert_flags(
+            "& 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' -Enco SQBFAFgA",
+            "powershell-encoded-command",
+            RiskLevel::Caution,
+        );
+
+        for parameter in ["-ed", "-ex", "-encoder", "-encodedCommandText", "-co"] {
+            assert_not_rule(
+                &format!("pwsh {parameter} SQBFAFgA"),
+                "powershell-encoded-command",
+            );
+        }
+        assert_not_rule(
+            "Write-Output 'pwsh -EncodedCommand SQBFAFgA'",
+            "powershell-encoded-command",
+        );
+        assert_not_rule(
+            "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Enc SQBFAFgA",
+            "powershell-encoded-command",
+        );
+    }
+
+    #[test]
+    fn powershell_here_strings_are_inert_and_code_after_terminators_is_assessed() {
+        for command in [
+            "$text = @'\nStop-Service Spooler; \"quotes\"; $(Stop-Service Spooler)\n'@\nGet-Service Spooler",
+            "$text = @\"\nStop-Service Spooler | $(Stop-Service Spooler)\n\"@\nGet-Service Spooler",
+            "@'\nStop-Service Spooler\n'@",
+            "$text = @'\nStop-Service Spooler\n  '@\nStop-Service Spooler",
+            "$text = @\"\n$(Stop-Service Spooler)\n\"@ trailing\nStop-Service Spooler",
+        ] {
+            assert_not_rule(command, "powershell-service-change");
+        }
+
+        for command in [
+            "$text = @'\nStop-Service Spooler\n'@\nStop-Service Spooler",
+            "$text = @\"\n$(Stop-Service Spooler)\n\"@\r\nStop-Service Spooler",
+        ] {
+            assert_flags(command, "powershell-service-change", RiskLevel::Destructive);
         }
     }
 }
