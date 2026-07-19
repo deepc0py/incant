@@ -5,8 +5,10 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct MockOllama {
     port: u16,
@@ -130,8 +132,20 @@ impl TestEnvironment {
         command
     }
 
+    fn wait_for_output(&self, child: Child, args: &[&str]) -> Output {
+        wait_for_incant(child, args)
+    }
+
     fn run(&self, args: &[&str]) -> Output {
-        self.command().args(args).output().expect("run incant")
+        let mut command = self.command();
+        command
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn incant {args:?}: {error}"));
+        self.wait_for_output(child, args)
     }
 
     fn assert_success(&self, args: &[&str]) -> Output {
@@ -171,6 +185,34 @@ impl TestEnvironment {
 impl Drop for TestEnvironment {
     fn drop(&mut self) {
         let _ = self.run(&["daemon", "stop"]);
+    }
+}
+
+fn wait_for_incant(mut child: Child, args: &[&str]) -> Output {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("reap incant {args:?}: {error}"));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("reap timed-out incant {args:?}: {error}"));
+                panic!(
+                    "incant {args:?} timed out after {PROCESS_TIMEOUT:?}\nstdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => panic!("poll incant {args:?}: {error}"),
+        }
     }
 }
 
@@ -243,15 +285,16 @@ fn windows_named_pipe_roundtrip_and_detached_lifecycle() {
 
     let mut clients = Vec::new();
     for _ in 0..4 {
+        let args = ["--pipe", "concurrent request"];
         let mut command = environment.command();
         command
-            .args(["--pipe", "concurrent request"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        clients.push(command.spawn().expect("spawn concurrent client"));
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        clients.push((command.spawn().expect("spawn concurrent client"), args));
     }
-    for client in clients {
-        let output = client.wait_with_output().expect("wait for client");
+    for (client, args) in clients {
+        let output = environment.wait_for_output(client, &args);
         assert!(output.status.success(), "concurrent client failed");
         assert_eq!(text(&output.stdout), "echo windows");
     }
