@@ -187,7 +187,8 @@ Describe 'install.ps1' {
             $BinaryPath -eq (Join-Path $script:InstallDir 'incant.exe')
         }
         Should -Invoke Wait-IncantBinaryUnlocked -Times 1 -Exactly -ParameterFilter {
-            $BinaryPath -eq (Join-Path $script:InstallDir 'incant.exe')
+            $BinaryPath -eq (Join-Path $script:InstallDir 'incant.exe') -and
+            $Operation -eq 'upgrade'
         }
         Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
             $Object -eq "Incant upgraded successfully: $(Join-Path $script:InstallDir 'incant.exe')"
@@ -197,14 +198,14 @@ Describe 'install.ps1' {
     It 'tolerates only documented daemon stop responses' {
         $binary = Join-Path $script:InstallDir 'incant.exe'
         {
-            Stop-IncantForUpgrade $binary
+            Stop-IncantForBinaryChange -BinaryPath $binary -Operation 'upgrade'
         } | Should -Not -Throw
 
         Mock Invoke-IncantDaemonStop {
             [pscustomobject]@{ ExitCode = 0; Output = 'unknown state' }
         }
         {
-            Stop-IncantForUpgrade $binary
+            Stop-IncantForBinaryChange -BinaryPath $binary -Operation 'upgrade'
         } | Should -Throw "*unexpected daemon stop response 'unknown state'*"
     }
 
@@ -215,7 +216,7 @@ Describe 'install.ps1' {
         }
 
         {
-            Stop-IncantForUpgrade $binary
+            Stop-IncantForBinaryChange -BinaryPath $binary -Operation 'upgrade'
         } | Should -Throw "*is still locked after stopping the daemon*"
     }
 
@@ -229,6 +230,65 @@ Describe 'install.ps1' {
         Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
             $Object -eq 'Open a new PowerShell session to load the Ctrl+K integration and persistent PATH.'
         }
+    }
+
+    It 'stops the running daemon and waits for release before uninstalling the binary' {
+        $binary = Join-Path $script:InstallDir 'incant.exe'
+        New-Item -ItemType Directory -Path $script:InstallDir -Force | Out-Null
+        Set-Content -LiteralPath $binary -Value 'installed executable'
+        $script:DaemonStopped = $false
+        Mock Invoke-IncantDaemonStop {
+            $script:DaemonStopped = $true
+            [pscustomobject]@{ ExitCode = 0; Output = 'Daemon stopped' }
+        }
+        Mock Wait-IncantBinaryUnlocked {
+            $script:DaemonStopped | Should -BeTrue
+            Test-Path -LiteralPath $BinaryPath | Should -BeTrue
+        }
+
+        Invoke-IncantInstaller -Uninstall -InstallDir $script:InstallDir `
+            -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath
+
+        Should -Invoke Invoke-IncantDaemonStop -Times 1 -Exactly -ParameterFilter {
+            $BinaryPath -eq $binary
+        }
+        Should -Invoke Wait-IncantBinaryUnlocked -Times 1 -Exactly -ParameterFilter {
+            $BinaryPath -eq $binary -and $Operation -eq 'uninstall'
+        }
+        Test-Path -LiteralPath $binary | Should -BeFalse
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter {
+            $Object -eq 'Incant uninstalled successfully.'
+        }
+    }
+
+    It 'fails precisely without reporting success when the binary cannot be deleted' {
+        $binary = Join-Path $script:InstallDir 'incant.exe'
+        New-Item -ItemType Directory -Path $script:InstallDir -Force | Out-Null
+        Set-Content -LiteralPath $binary -Value 'installed executable'
+        Mock Remove-Item {
+            throw [IO.IOException]::new('The process cannot access the file because it is in use.')
+        } -ParameterFilter { $LiteralPath -eq $binary }
+
+        {
+            Invoke-IncantInstaller -Uninstall -InstallDir $script:InstallDir `
+                -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath
+        } | Should -Throw "*Cannot uninstall Incant: failed to remove '$binary':*file because it is in use*"
+
+        Test-Path -LiteralPath $binary | Should -BeTrue
+        Should -Invoke Write-Host -Times 0 -Exactly -ParameterFilter {
+            $Object -eq 'Incant uninstalled successfully.'
+        }
+    }
+
+    It 'is idempotent when the installed binary is already absent' {
+        {
+            Invoke-IncantInstaller -Uninstall -InstallDir $script:InstallDir `
+                -ConfigDir $script:ConfigDir -ProfilePath $script:ProfilePath
+        } | Should -Not -Throw
+
+        Should -Invoke Invoke-IncantDaemonStop -Times 0 -Exactly
+        Should -Invoke Wait-IncantBinaryUnlocked -Times 0 -Exactly
+        Test-Path -LiteralPath (Join-Path $script:InstallDir 'incant.exe') | Should -BeFalse
     }
 
     It 'uninstalls owned state while preserving config and unrelated files' {

@@ -291,6 +291,7 @@ function Invoke-IncantDaemonStop {
 function Wait-IncantBinaryUnlocked {
     param(
         [Parameter(Mandatory)][string] $BinaryPath,
+        [Parameter(Mandatory)][ValidateSet('upgrade', 'uninstall')][string] $Operation,
         [int] $TimeoutMilliseconds = 5000
     )
 
@@ -308,26 +309,29 @@ function Wait-IncantBinaryUnlocked {
         }
         catch [IO.IOException] {
             if ([DateTime]::UtcNow -ge $deadline) {
-                throw "Cannot upgrade Incant: '$BinaryPath' is still locked after stopping the daemon."
+                throw "Cannot $Operation Incant: '$BinaryPath' is still locked after stopping the daemon."
             }
             Start-Sleep -Milliseconds 100
         }
     } while ($true)
 }
 
-function Stop-IncantForUpgrade {
-    param([Parameter(Mandatory)][string] $BinaryPath)
+function Stop-IncantForBinaryChange {
+    param(
+        [Parameter(Mandatory)][string] $BinaryPath,
+        [Parameter(Mandatory)][ValidateSet('upgrade', 'uninstall')][string] $Operation
+    )
 
     $result = Invoke-IncantDaemonStop $BinaryPath
     if ($result.ExitCode -ne 0) {
         $detail = if ([string]::IsNullOrWhiteSpace($result.Output)) { '' } else { ": $($result.Output)" }
-        throw "Cannot upgrade Incant: 'incant.exe daemon stop' failed with status $($result.ExitCode)$detail"
+        throw "Cannot $Operation Incant: 'incant.exe daemon stop' failed with status $($result.ExitCode)$detail"
     }
     if ($result.Output -notin @('Daemon stopped', 'Daemon is not running')) {
-        throw "Cannot upgrade Incant: unexpected daemon stop response '$($result.Output)'."
+        throw "Cannot $Operation Incant: unexpected daemon stop response '$($result.Output)'."
     }
 
-    Wait-IncantBinaryUnlocked $BinaryPath
+    Wait-IncantBinaryUnlocked -BinaryPath $BinaryPath -Operation $Operation
 }
 
 function Install-IncantFiles {
@@ -342,7 +346,7 @@ function Install-IncantFiles {
     $installedBinary = Join-Path $Destination 'incant.exe'
     $isUpgrade = Test-Path -LiteralPath $installedBinary
     if ($isUpgrade) {
-        Stop-IncantForUpgrade $installedBinary
+        Stop-IncantForBinaryChange -BinaryPath $installedBinary -Operation 'upgrade'
     }
 
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
@@ -446,7 +450,18 @@ function Uninstall-Incant {
     )
 
     $binary = Join-Path $Destination 'incant.exe'
-    Remove-Item -LiteralPath $binary -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $binary) {
+        Stop-IncantForBinaryChange -BinaryPath $binary -Operation 'uninstall'
+        try {
+            Remove-Item -LiteralPath $binary -Force -ErrorAction Stop
+        }
+        catch {
+            throw "Cannot uninstall Incant: failed to remove '$binary': $($_.Exception.Message)"
+        }
+        if (Test-Path -LiteralPath $binary) {
+            throw "Cannot uninstall Incant: '$binary' still exists after removal."
+        }
+    }
     if ((Test-Path -LiteralPath $Destination) -and
         @(Get-ChildItem -LiteralPath $Destination -Force).Count -eq 0) {
         Remove-Item -LiteralPath $Destination -Force
@@ -462,6 +477,8 @@ function Uninstall-Incant {
             Remove-Item -LiteralPath $ConfigurationDirectory -Force
         }
     }
+
+    Write-Host 'Incant uninstalled successfully.'
 }
 
 function Invoke-IncantInstaller {
