@@ -136,7 +136,20 @@ struct DaemonFixture {
 
 impl DaemonFixture {
     /// Start a daemon wired to a mock backend that answers `generate_body`.
+    ///
+    /// Clipboard copy is disabled so client-driving tests stay
+    /// deterministic on headless CI runners; clipboard-specific tests use
+    /// `start_with_preferences`.
     fn start(generate_status: u16, generate_body: &str) -> Self {
+        Self::start_with_preferences(generate_status, generate_body, "clipboard = false")
+    }
+
+    /// Start a daemon with explicit `[preferences]` entries.
+    fn start_with_preferences(
+        generate_status: u16,
+        generate_body: &str,
+        preferences: &str,
+    ) -> Self {
         let mock = MockOllama::start(generate_status, generate_body.to_string());
 
         let home = tempfile::tempdir().expect("tempdir");
@@ -147,8 +160,9 @@ impl DaemonFixture {
         std::fs::write(
             config_home.join("incant/config.toml"),
             format!(
-                "[backend]\ntype = \"ollama\"\nhost = \"{}\"\ndefault_profile = \"default\"\n\n[profiles.default]\nmodel = \"mock-model\"\ntemperature = 0.1\n",
-                mock.host()
+                "[backend]\ntype = \"ollama\"\nhost = \"{}\"\ndefault_profile = \"default\"\n\n[profiles.default]\nmodel = \"mock-model\"\ntemperature = 0.1\n\n[preferences]\n{}\n",
+                mock.host(),
+                preferences
             ),
         )
         .unwrap();
@@ -601,4 +615,96 @@ fn started_daemon_is_detached_from_launcher_session() {
     assert!(answers, "daemon should answer on its socket");
     assert_eq!(pgid, pid, "daemon must lead its own process group");
     assert_eq!(sid, pid, "daemon must lead its own session");
+}
+
+// ── clipboard ──────────────────────────────────────────────────────────
+
+/// Direct mode copies the answer to the macOS pasteboard; `--pipe` is a
+/// pure scripting interface and never touches it. One test drives both so
+/// the shared pasteboard is never contended by parallel tests.
+#[test]
+#[cfg(target_os = "macos")]
+fn direct_mode_copies_to_clipboard_and_pipe_mode_does_not() {
+    let daemon = DaemonFixture::start_with_preferences(
+        200,
+        r#"{"response":"git log --oneline -5","done":true}"#,
+        "clipboard = true",
+    );
+
+    let pbpaste = || {
+        let output = Command::new("pbpaste").output().expect("pbpaste");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    // Seed a sentinel, then check --pipe leaves it untouched.
+    let mut seed = Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("pbcopy");
+    use std::io::Write as _;
+    seed.stdin
+        .take()
+        .unwrap()
+        .write_all(b"sentinel")
+        .expect("seed pasteboard");
+    assert!(seed.wait().expect("pbcopy wait").success());
+
+    let piped = daemon
+        .client_command()
+        .args(["--pipe", "recent commits"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run client");
+    assert!(piped.status.success());
+    assert_eq!(pbpaste(), "sentinel", "--pipe must not touch the clipboard");
+
+    // Direct mode prints the command and copies it.
+    let direct = daemon
+        .client_command()
+        .arg("recent commits")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run client");
+    assert!(
+        direct.status.success(),
+        "client failed: {}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&direct.stdout).trim(),
+        "git log --oneline -5"
+    );
+    assert_eq!(
+        pbpaste(),
+        "git log --oneline -5",
+        "pasteboard should hold the generated command"
+    );
+}
+
+/// With no Wayland or X11 session, clipboard copy fails loudly — but only
+/// after the command has been printed, so the answer is never lost.
+#[test]
+#[cfg(target_os = "linux")]
+fn clipboard_failure_is_loud_but_never_eats_the_answer() {
+    let daemon = DaemonFixture::start_with_preferences(
+        200,
+        r#"{"response":"uptime","done":true}"#,
+        "clipboard = true",
+    );
+
+    // client_command() clears the env, so no DISPLAY/WAYLAND_DISPLAY leaks.
+    let output = daemon
+        .client_command()
+        .arg("how long has this box been up")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run client");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "uptime");
+    assert!(!output.status.success(), "clipboard failure must be loud");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("clipboard"),
+        "stderr should explain the clipboard failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

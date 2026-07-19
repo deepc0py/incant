@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Generated commands are copied to the system clipboard as well as printed, ready to paste. Applies to direct and interactive modes; `--pipe` stays a pure scripting interface and never touches the clipboard. One helper per platform — `pbcopy` (macOS), `wl-copy`/`xclip` chosen by session type (Linux), `clip` (Windows, written as UTF-16 so Unicode survives). A copy failure is reported on stderr with a nonzero exit after the command has been printed, so the answer is never lost. Opt out with `clipboard = false` under `[preferences]`.
+
 ### Changed
 
 - `incant "query"` now translates directly and prints the command — no TUI popup gating the answer behind a second Enter. The interactive popup remains for bare `incant` (and Ctrl+K).

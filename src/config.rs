@@ -126,6 +126,10 @@ pub struct Preferences {
     /// Show advisory warnings when a generated command looks destructive.
     #[serde(default = "default_true")]
     pub safety_warnings: bool,
+    /// Copy the generated command to the system clipboard (interactive and
+    /// direct modes; `--pipe` never touches the clipboard).
+    #[serde(default = "default_true")]
+    pub clipboard: bool,
 }
 
 impl Default for Preferences {
@@ -134,6 +138,7 @@ impl Default for Preferences {
             modern_tools: true,
             verbose_flags: true,
             safety_warnings: true,
+            clipboard: true,
         }
     }
 }

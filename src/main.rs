@@ -691,6 +691,12 @@ async fn handle_query(
             }
             // Output just the command to stdout
             println!("{}", generated.command);
+            // Clipboard copy is part of the interactive answer; --pipe
+            // stays a pure scripting interface with no side effects. The
+            // command is already printed, so a copy failure loses nothing.
+            if !pipe_mode && config.preferences.clipboard {
+                client::clipboard::copy(&generated.command)?;
+            }
         }
         Err(e) => {
             eprintln!("Error: {}", e);
