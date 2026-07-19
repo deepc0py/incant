@@ -2,6 +2,8 @@
 //!
 //! Renders a single-line input prompt similar to `gum input`.
 
+#[cfg(not(windows))]
+use anyhow::Context as _;
 use anyhow::Result;
 #[cfg(windows)]
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -30,11 +32,20 @@ pub enum TuiResult {
 }
 
 /// Run the TUI and return the user's query.
-pub fn run_tui(initial_query: Option<String>) -> Result<TuiResult> {
+pub fn run_tui() -> Result<TuiResult> {
     // Like fzf, we use:
     // - stderr for TUI output (goes to terminal even in command substitution)
-    // - stdin for keyboard input (redirected from /dev/tty by shell widget)
+    // - the controlling terminal (/dev/tty) for keyboard input, so a piped
+    //   or closed stdin can never silently cancel the prompt
     // - stdout only for final command (captured by shell)
+
+    // Grab the terminal before touching raw mode: failing here must not
+    // leave the terminal in a broken state, and gives the clearest error.
+    #[cfg(not(windows))]
+    let mut tty = std::fs::File::open("/dev/tty").context(
+        "interactive mode needs a terminal (cannot open /dev/tty); \
+         pass the query as an argument or use --pipe",
+    )?;
 
     // Setup terminal - write TUI to stderr (like fzf does)
     enable_raw_mode()?;
@@ -48,7 +59,10 @@ pub fn run_tui(initial_query: Option<String>) -> Result<TuiResult> {
     let mut terminal = Terminal::new(backend)?;
 
     // Run the input loop
-    let result = run_input_loop(&mut terminal, initial_query);
+    #[cfg(not(windows))]
+    let result = run_input_loop(&mut terminal, &mut tty);
+    #[cfg(windows)]
+    let result = run_input_loop(&mut terminal);
 
     // Restore terminal state
     disable_raw_mode()?;
@@ -92,21 +106,23 @@ fn apply_input_command(input_text: &mut String, command: InputCommand) -> Option
     None
 }
 
-/// The Unix input loop reads stdin directly to avoid crossterm event-system issues on macOS.
+/// The Unix input loop reads the controlling terminal directly to avoid
+/// crossterm event-system issues on macOS.
 #[cfg(not(windows))]
 fn run_input_loop<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
-    initial_query: Option<String>,
+    tty: &mut impl Read,
 ) -> Result<TuiResult> {
-    let mut input_text = initial_query.unwrap_or_default();
-    let mut stdin = io::stdin();
+    let mut input_text = String::new();
     let mut buf = [0u8; 1];
 
     loop {
         terminal.draw(|frame| draw_ui(frame, &input_text))?;
 
-        if stdin.read(&mut buf)? == 0 {
-            return Ok(TuiResult::Cancelled);
+        if tty.read(&mut buf)? == 0 {
+            // EOF on the controlling terminal means the terminal went away,
+            // not that the user cancelled. Fail loudly.
+            return Err(anyhow::anyhow!("terminal closed while awaiting input"));
         }
 
         let command = match buf[0] {
@@ -130,7 +146,7 @@ fn run_input_loop<W: Write>(
                 let mut utf8_buf = vec![first_byte];
                 for _ in 1..width {
                     let mut byte = [0u8; 1];
-                    if stdin.read(&mut byte)? == 1 {
+                    if tty.read(&mut byte)? == 1 {
                         utf8_buf.push(byte[0]);
                     }
                 }
@@ -159,11 +175,8 @@ fn run_input_loop<W: Write>(
 }
 
 #[cfg(windows)]
-fn run_input_loop<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
-    initial_query: Option<String>,
-) -> Result<TuiResult> {
-    let mut input_text = initial_query.unwrap_or_default();
+fn run_input_loop<W: Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> Result<TuiResult> {
+    let mut input_text = String::new();
 
     loop {
         terminal.draw(|frame| draw_ui(frame, &input_text))?;

@@ -227,6 +227,18 @@ impl DaemonFixture {
     fn generate_requests(&self) -> Vec<serde_json::Value> {
         self.mock.generate_requests()
     }
+
+    /// A client `incant` invocation wired to this fixture's isolated env.
+    fn client_command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_incant"));
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
+            .env("XDG_RUNTIME_DIR", &self.runtime_dir);
+        command
+    }
 }
 
 impl Drop for DaemonFixture {
@@ -489,4 +501,104 @@ fn shutdown_message_stops_the_daemon() {
         !daemon.socket_path.exists(),
         "socket file should be removed on shutdown"
     );
+}
+
+// ── client CLI behavior ────────────────────────────────────────────────
+
+/// A query passed as an argument is answered directly on stdout — no TUI,
+/// no interactive terminal required. Regression test for the silent
+/// exit-0-with-no-output failure when stdin was not a terminal.
+#[test]
+fn query_argument_translates_directly_without_a_tty() {
+    let daemon = DaemonFixture::start(200, r#"{"response":"ls -lt","done":true}"#);
+
+    let output = daemon
+        .client_command()
+        .arg("list and sort folders by last modified")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run client");
+
+    assert!(
+        output.status.success(),
+        "client failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ls -lt");
+}
+
+#[test]
+fn pipe_mode_still_translates_directly() {
+    let daemon = DaemonFixture::start(200, r#"{"response":"df -h","done":true}"#);
+
+    let output = daemon
+        .client_command()
+        .args(["--pipe", "show disk usage"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run client");
+
+    assert!(
+        output.status.success(),
+        "client failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "df -h");
+}
+
+// ── daemon detachment ──────────────────────────────────────────────────
+
+/// `incant daemon start` must detach the daemon into its own session.
+/// Otherwise it shares the launcher's foreground process group (killed by
+/// Ctrl+C in the terminal) and controlling terminal (killed by SIGHUP when
+/// the terminal closes), forcing a cold start in every new terminal.
+#[test]
+fn started_daemon_is_detached_from_launcher_session() {
+    let mock = MockOllama::start(200, r#"{"response":"true","done":true}"#.to_string());
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_home = home.path().join("config");
+    let runtime_dir = home.path().join("runtime");
+    std::fs::create_dir_all(config_home.join("incant")).unwrap();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::write(
+        config_home.join("incant/config.toml"),
+        format!(
+            "[backend]\ntype = \"ollama\"\nhost = \"{}\"\ndefault_profile = \"default\"\n\n[profiles.default]\nmodel = \"mock-model\"\ntemperature = 0.1\n",
+            mock.host()
+        ),
+    )
+    .unwrap();
+
+    // The launcher leads its own process group, standing in for an
+    // interactive shell's foreground group.
+    use std::os::unix::process::CommandExt;
+    let status = Command::new(env!("CARGO_BIN_EXE_incant"))
+        .args(["daemon", "start"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .process_group(0)
+        .status()
+        .expect("run daemon start");
+    assert!(status.success(), "daemon start failed");
+
+    let pid: i32 = std::fs::read_to_string(runtime_dir.join("incant.pid"))
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+
+    let pgid = unsafe { libc::getpgid(pid) };
+    let sid = unsafe { libc::getsid(pid) };
+    let answers = UnixStream::connect(runtime_dir.join("incant.sock")).is_ok();
+
+    // Tear down before asserting so a failure can't leak the daemon.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+
+    assert!(answers, "daemon should answer on its socket");
+    assert_eq!(pgid, pid, "daemon must lead its own process group");
+    assert_eq!(sid, pid, "daemon must lead its own session");
 }

@@ -160,6 +160,23 @@ async fn start_daemon() -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Detach into a new session so the daemon outlives its launching
+        // terminal: without setsid it shares the client's foreground
+        // process group (killed by Ctrl+C) and controlling terminal
+        // (killed by SIGHUP when the terminal closes).
+        // SAFETY: setsid is async-signal-safe and allocation-free.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -617,12 +634,10 @@ async fn handle_query(
             std::process::exit(1);
         }
 
-        // Try to auto-start
+        // Try to auto-start. start_daemon() only returns once the daemon
+        // has reported readiness, so no settling delay is needed.
         eprintln!("Starting daemon...");
         start_daemon().await?;
-
-        // Give it time to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
         if !daemon::server::probe_daemon_status().await? {
             eprintln!("Failed to start daemon. Check your configuration.");
@@ -631,17 +646,21 @@ async fn handle_query(
     }
 
     // Get the query
-    let final_query = if pipe_mode {
-        // In pipe mode, query must be provided
-        query.ok_or_else(|| anyhow::anyhow!("Query required in --pipe mode"))?
-    } else {
-        // Run TUI
-        match client::run_tui(query)? {
+    let final_query = match query {
+        // Direct mode: an explicit query means "translate this now" — never
+        // gate the answer behind an interactive popup.
+        Some(q) => q,
+        None if pipe_mode => {
+            return Err(anyhow::anyhow!("Query required in --pipe mode"));
+        }
+        None => match client::run_tui()? {
             client::tui::TuiResult::Query(q) => q,
             client::tui::TuiResult::Cancelled => {
-                return Ok(());
+                // SIGINT convention (like fzf): lets widgets and scripts
+                // distinguish "user dismissed" from an empty command.
+                std::process::exit(130);
             }
-        }
+        },
     };
 
     // Gather context
