@@ -421,6 +421,9 @@ impl Config {
 
     /// Build the system prompt based on context and preferences.
     pub fn build_system_prompt(&self, context: &crate::protocol::Context) -> String {
+        if let Some(windows) = context.windows.as_ref() {
+            return build_windows_system_prompt(context, windows);
+        }
         let modern_tools_note = if !self.preferences.modern_tools {
             "- Use standard POSIX tools (grep, find, cat)".to_string()
         } else if context.tools.is_empty() {
@@ -481,6 +484,62 @@ CWD: {}{}"#,
             extra
         )
     }
+}
+
+fn build_windows_system_prompt(
+    context: &crate::protocol::Context,
+    windows: &crate::protocol::WindowsContext,
+) -> String {
+    let mut extra = String::new();
+    if !windows.diagnostic_tools.is_empty() {
+        extra.push_str(&format!(
+            "\nInstalled diagnostic tools: {}",
+            windows.diagnostic_tools.join(", ")
+        ));
+    }
+    if !context.projects.is_empty() {
+        extra.push_str(&format!("\nProject: {}", context.projects.join(", ")));
+    }
+    if let Some(git) = &context.git {
+        extra.push_str(&format!("\nGit: {git}"));
+    }
+    if !context.env_flags.is_empty() {
+        extra.push_str(&format!("\nEnvironment: {}", context.env_flags.join(", ")));
+    }
+
+    format!(
+        r#"You are a Windows PowerShell command generator. Your ONLY output is one exact command to run.
+
+Rules:
+- Target pwsh 7.4 or newer and emit exactly one command, never alternatives
+- Output ONLY the command, with no markdown, backticks, explanation, or preamble
+- Use full cmdlet and parameter names; never use aliases or abbreviated parameter names
+- Use Get-WinEvent with -FilterHashtable for event logs
+- Use Get-CimInstance, never Get-WmiObject
+- Use Get-PnpDevice and pnputil.exe for devices and drivers
+- Filter typed objects and properties; never parse localized display text
+- Use native Get-Net* cmdlets, Resolve-DnsName, and Test-NetConnection for networking
+- Use Get-Service and Get-Process for service and process diagnostics
+- Use DISM.exe and sfc.exe for image and system-file repair as appropriate
+- If Administrator rights are required, prepend exactly '# Requires Administrator' on its own line
+- Never self-elevate, invoke RunAs, or bypass execution policy
+- Make reasonable assumptions for ambiguous requests
+
+Context:
+OS: {} {} (build {})
+Shell: {}
+PowerShell: {}
+Elevated: {}
+CWD: {}{}"#,
+        windows.caption,
+        windows.version,
+        windows.build,
+        context.shell,
+        windows.powershell_version,
+        if windows.elevated { "yes" } else { "no" },
+        context.cwd.display(),
+        extra
+    )
 }
 
 #[cfg(test)]
@@ -563,6 +622,7 @@ mod tests {
             tools: tools.into_iter().map(String::from).collect(),
             git: git.map(String::from),
             env_flags: Vec::new(),
+            windows: None,
         }
     }
 
@@ -596,6 +656,75 @@ mod tests {
         let prompt = config.build_system_prompt(&ctx(vec![], vec!["rg"], None));
         assert!(prompt.contains("standard POSIX tools"));
         assert!(!prompt.contains("installed modern tools"));
+    }
+
+    #[test]
+    fn posix_prompt_remains_exactly_unchanged() {
+        let config = Config::default();
+        let prompt = config.build_system_prompt(&ctx(vec![], vec![], None));
+        assert_eq!(
+            prompt,
+            r#"You are a shell command generator. Your ONLY output is the exact command to run.
+
+Rules:
+- Output ONLY the command, nothing else
+- No markdown, no backticks, no explanations
+- No preamble like "Here's the command:"
+- If multiple commands needed, separate with && or ;
+- Make reasonable assumptions for ambiguous requests
+- Use modern tools when appropriate (ripgrep over grep, fd over find, bat over cat)
+- Prefer long flags for clarity (--recursive over -r) unless brevity is clearly preferred
+
+Context:
+OS: Darwin 25.3.0
+Shell: /bin/zsh
+CWD: /work/demo"#
+        );
+    }
+
+    #[test]
+    fn windows_context_selects_powershell_policy() {
+        let mut context = ctx(vec!["rust"], vec![], Some("branch main, clean"));
+        context.shell = "pwsh".to_string();
+        context.os = "Microsoft Windows 11 Pro 10.0.26100 (build 26100)".to_string();
+        context.windows = Some(crate::protocol::WindowsContext {
+            caption: "Microsoft Windows 11 Pro".to_string(),
+            version: "10.0.26100".to_string(),
+            build: "26100".to_string(),
+            powershell_version: "7.4.6".to_string(),
+            elevated: false,
+            diagnostic_tools: vec![
+                "pwsh.exe".to_string(),
+                "pnputil.exe".to_string(),
+                "wpr.exe".to_string(),
+            ],
+        });
+
+        let prompt = Config::default().build_system_prompt(&context);
+        for required in [
+            "Target pwsh 7.4 or newer",
+            "full cmdlet and parameter names",
+            "Get-WinEvent with -FilterHashtable",
+            "Get-CimInstance, never Get-WmiObject",
+            "Get-PnpDevice and pnputil.exe",
+            "typed objects and properties",
+            "Get-Net* cmdlets, Resolve-DnsName, and Test-NetConnection",
+            "Get-Service and Get-Process",
+            "DISM.exe and sfc.exe",
+            "# Requires Administrator",
+            "Never self-elevate",
+            "emit exactly one command",
+            "PowerShell: 7.4.6",
+            "Elevated: no",
+            "Installed diagnostic tools: pwsh.exe, pnputil.exe, wpr.exe",
+        ] {
+            assert!(
+                prompt.contains(required),
+                "missing Windows policy: {required}"
+            );
+        }
+        assert!(!prompt.contains("standard POSIX tools"));
+        assert!(!prompt.contains("separate with &&"));
     }
 
     #[test]

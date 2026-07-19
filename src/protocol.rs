@@ -23,6 +23,24 @@ pub struct Request {
     pub explain: bool,
 }
 
+/// Windows-specific host details used to select PowerShell command policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowsContext {
+    /// Product caption, for example "Microsoft Windows 11 Pro".
+    pub caption: String,
+    /// Operating system version, for example "10.0.26100".
+    pub version: String,
+    /// Windows build number, for example "26100".
+    pub build: String,
+    /// PowerShell version reported by the local PowerShell executable.
+    pub powershell_version: String,
+    /// Whether the current process token belongs to the Administrator role.
+    pub elevated: bool,
+    /// Curated Windows diagnostic executables discovered on PATH.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_tools: Vec<String>,
+}
+
 /// System context gathered by the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Context {
@@ -47,6 +65,9 @@ pub struct Context {
     /// Environment flags: "ssh", "tmux", "docker".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_flags: Vec<String>,
+    /// Windows-specific context. Absent on non-Windows hosts and older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<WindowsContext>,
 }
 
 /// Response sent from daemon to client.
@@ -207,6 +228,7 @@ mod tests {
                 tools: Vec::new(),
                 git: None,
                 env_flags: Vec::new(),
+                windows: None,
             },
             model: None,
             temperature: None,
@@ -230,6 +252,7 @@ mod tests {
                 tools: Vec::new(),
                 git: None,
                 env_flags: Vec::new(),
+                windows: None,
             },
             model: Some("qwen2.5-coder:1.5b".to_string()),
             temperature: Some(0.2),
@@ -260,6 +283,7 @@ mod tests {
                 tools: Vec::new(),
                 git: None,
                 env_flags: Vec::new(),
+                windows: None,
             },
             model: None,
             temperature: None,
@@ -267,5 +291,28 @@ mod tests {
         };
         let round: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert!(round.explain);
+    }
+
+    #[test]
+    fn context_without_windows_details_remains_wire_compatible() {
+        let json = r#"{"cwd":"/","shell":"sh","os":"linux"}"#;
+        let context: Context = serde_json::from_str(json).unwrap();
+        assert!(context.windows.is_none());
+        assert!(!serde_json::to_string(&context).unwrap().contains("windows"));
+    }
+
+    #[test]
+    fn windows_context_roundtrips_through_json() {
+        let windows = WindowsContext {
+            caption: "Microsoft Windows 11 Pro".to_string(),
+            version: "10.0.26100".to_string(),
+            build: "26100".to_string(),
+            powershell_version: "7.4.6".to_string(),
+            elevated: true,
+            diagnostic_tools: vec!["wpr.exe".to_string(), "pnputil.exe".to_string()],
+        };
+        let json = serde_json::to_string(&windows).unwrap();
+        let parsed: WindowsContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, windows);
     }
 }
